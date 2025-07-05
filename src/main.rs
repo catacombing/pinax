@@ -14,6 +14,7 @@ use crate::window::Window;
 
 mod geometry;
 mod renderer;
+mod skia;
 mod wayland;
 mod window;
 

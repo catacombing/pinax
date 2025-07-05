@@ -11,6 +11,7 @@ edition = "2024"
 [dependencies]
 glutin = { version = "0.32.3", default-features = false, features = ["egl", "wayland"] }
 raw-window-handle = "0.6.2"
+skia-safe = { version = "0.87.0", default-features = false, features = ["binary-cache", "wayland"] }
 smithay-client-toolkit = { version = "0.19.2", default-features = false, features = ["xkbcommon"] }
 thiserror = "2.0.12"
 tracing = "0.1.41"

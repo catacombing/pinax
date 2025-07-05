@@ -3,9 +3,8 @@
 use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
-use std::{mem, ptr};
 
-use glutin::config::{Api, ConfigTemplateBuilder};
+use glutin::config::{Api, Config, ConfigTemplateBuilder};
 use glutin::context::{ContextApi, ContextAttributesBuilder, PossiblyCurrentContext, Version};
 use glutin::display::Display;
 use glutin::prelude::*;
@@ -14,13 +13,9 @@ use raw_window_handle::{RawWindowHandle, WaylandWindowHandle};
 use smithay_client_toolkit::reexports::client::Proxy;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 
-use crate::geometry::{Position, Size};
+use crate::geometry::Size;
 use crate::gl;
-use crate::gl::types::{GLfloat, GLint, GLuint};
-
-// OpenGL shader programs.
-const VERTEX_SHADER: &str = include_str!("../shaders/vertex.glsl");
-const FRAGMENT_SHADER: &str = include_str!("../shaders/fragment.glsl");
+use crate::skia::GlConfig as SkiaGlConfig;
 
 /// OpenGL renderer.
 #[derive(Debug)]
@@ -43,62 +38,20 @@ impl Renderer {
     }
 
     /// Perform drawing with this renderer mapped.
-    pub fn draw<F: FnOnce(&Renderer)>(&mut self, size: Size, fun: F) {
-        self.sized(size).make_current();
+    pub fn draw<F: FnOnce(&SizedRenderer)>(&mut self, size: Size, fun: F) {
+        let sized = self.sized(size);
+        sized.make_current();
 
         // Resize OpenGL viewport.
         //
         // This isn't done in `Self::resize` since the renderer must be current.
         unsafe { gl::Viewport(0, 0, size.width as i32, size.height as i32) };
 
-        fun(self);
+        fun(sized);
 
         unsafe { gl::Flush() };
 
-        self.sized(size).swap_buffers();
-    }
-
-    /// Render texture at a position in viewport-coordinates.
-    ///
-    /// Specifying a `size` will automatically scale the texture to render at
-    /// the desired size. Otherwise the texture's size will be used instead.
-    pub fn draw_texture_at(
-        &self,
-        texture: &Texture,
-        mut position: Position<f32>,
-        size: impl Into<Option<Size<f32>>>,
-    ) {
-        // Fail before renderer initialization.
-        //
-        // The sized state should always be initialized since it only makes sense to
-        // call this function within `Self::draw`'s closure.
-        let sized = match &self.sized {
-            Some(sized) => sized,
-            None => unreachable!(),
-        };
-
-        let (width, height) = match size.into() {
-            Some(Size { width, height }) => (width, height),
-            None => (texture.width as f32, texture.height as f32),
-        };
-
-        unsafe {
-            // Matrix transforming vertex positions to desired size.
-            let size: Size<f32> = sized.size.into();
-            let x_scale = width / size.width;
-            let y_scale = height / size.height;
-            let matrix = [x_scale, 0., 0., y_scale];
-            gl::UniformMatrix2fv(sized.uniform_matrix, 1, gl::FALSE, matrix.as_ptr());
-
-            // Set texture position offset.
-            position.x /= size.width / 2.;
-            position.y /= size.height / 2.;
-            gl::Uniform2fv(sized.uniform_position, 1, [position.x, -position.y].as_ptr());
-
-            gl::BindTexture(gl::TEXTURE_2D, texture.id);
-
-            gl::DrawArrays(gl::TRIANGLES, 0, 6);
-        }
+        sized.swap_buffers();
     }
 
     /// Get render state requiring a size.
@@ -122,12 +75,10 @@ impl Renderer {
 /// This state is initialized on-demand, to avoid Mesa's issue with resizing
 /// before the first draw.
 #[derive(Debug)]
-struct SizedRenderer {
-    uniform_position: GLint,
-    uniform_matrix: GLint,
-
+pub struct SizedRenderer {
     egl_surface: Surface<WindowSurface>,
     egl_context: PossiblyCurrentContext,
+    egl_config: Config,
 
     size: Size,
 }
@@ -136,12 +87,17 @@ impl SizedRenderer {
     /// Create sized renderer state.
     fn new(display: &Display, surface: &WlSurface, size: Size) -> Self {
         // Create EGL surface and context and make it current.
-        let (egl_surface, egl_context) = Self::create_surface(display, surface, size);
+        let (egl_surface, egl_context, egl_config) = Self::create_surface(display, surface, size);
 
-        // Setup OpenGL program.
-        let (uniform_position, uniform_matrix) = Self::create_program();
+        Self { egl_surface, egl_context, egl_config, size }
+    }
 
-        Self { uniform_position, uniform_matrix, egl_surface, egl_context, size }
+    /// Get Skia OpenGL configuration.
+    pub fn skia_config(&self) -> SkiaGlConfig {
+        SkiaGlConfig {
+            stencil_size: self.egl_config.stencil_size() as usize,
+            sample_count: self.egl_config.num_samples() as usize,
+        }
     }
 
     /// Resize the renderer.
@@ -175,7 +131,7 @@ impl SizedRenderer {
         display: &Display,
         surface: &WlSurface,
         size: Size,
-    ) -> (Surface<WindowSurface>, PossiblyCurrentContext) {
+    ) -> (Surface<WindowSurface>, PossiblyCurrentContext, Config) {
         assert!(size.width > 0 && size.height > 0);
 
         // Create EGL config.
@@ -212,131 +168,6 @@ impl SizedRenderer {
         egl_context.make_current(&egl_surface).unwrap();
         egl_surface.set_swap_interval(&egl_context, SwapInterval::DontWait).unwrap();
 
-        (egl_surface, egl_context)
-    }
-
-    /// Create the OpenGL program.
-    fn create_program() -> (GLint, GLint) {
-        unsafe {
-            // Create vertex shader.
-            let vertex_shader = gl::CreateShader(gl::VERTEX_SHADER);
-            gl::ShaderSource(
-                vertex_shader,
-                1,
-                [VERTEX_SHADER.as_ptr()].as_ptr() as *const _,
-                &(VERTEX_SHADER.len() as i32) as *const _,
-            );
-            gl::CompileShader(vertex_shader);
-
-            // Create fragment shader.
-            let fragment_shader = gl::CreateShader(gl::FRAGMENT_SHADER);
-            gl::ShaderSource(
-                fragment_shader,
-                1,
-                [FRAGMENT_SHADER.as_ptr()].as_ptr() as *const _,
-                &(FRAGMENT_SHADER.len() as i32) as *const _,
-            );
-            gl::CompileShader(fragment_shader);
-
-            // Create shader program.
-            let program = gl::CreateProgram();
-            gl::AttachShader(program, vertex_shader);
-            gl::AttachShader(program, fragment_shader);
-            gl::LinkProgram(program);
-            gl::UseProgram(program);
-
-            // Generate VBO.
-            let mut vbo = 0;
-            gl::GenBuffers(1, &mut vbo);
-            gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
-
-            // Fill VBO with vertex positions.
-            #[rustfmt::skip]
-            let vertices: [GLfloat; 12] = [
-                -1.0,  1.0, // Top-left
-                -1.0, -1.0, // Bottom-left
-                 1.0, -1.0, // Bottom-right
-
-                -1.0,  1.0, // Top-left
-                 1.0, -1.0, // Bottom-right
-                 1.0,  1.0, // Top-right
-            ];
-            gl::BufferData(
-                gl::ARRAY_BUFFER,
-                (mem::size_of::<GLfloat>() * vertices.len()) as isize,
-                vertices.as_ptr() as *const _,
-                gl::STATIC_DRAW,
-            );
-
-            // Define VBO layout.
-            let location = gl::GetAttribLocation(program, c"aVertexPosition".as_ptr()) as GLuint;
-            gl::VertexAttribPointer(
-                location,
-                2,
-                gl::FLOAT,
-                gl::FALSE,
-                2 * mem::size_of::<GLfloat>() as i32,
-                ptr::null(),
-            );
-            gl::EnableVertexAttribArray(0);
-
-            // Get uniform locations.
-            let uniform_position = gl::GetUniformLocation(program, c"uPosition".as_ptr());
-            let uniform_matrix = gl::GetUniformLocation(program, c"uMatrix".as_ptr());
-
-            (uniform_position, uniform_matrix)
-        }
-    }
-}
-
-/// OpenGL texture.
-#[derive(Debug)]
-pub struct Texture {
-    pub width: usize,
-    pub height: usize,
-
-    id: u32,
-}
-
-impl Texture {
-    /// Load a buffer as texture into OpenGL.
-    pub fn new(buffer: &[u8], width: usize, height: usize) -> Self {
-        Self::new_with_format(buffer, width, height, gl::RGBA)
-    }
-
-    pub fn new_with_format(buffer: &[u8], width: usize, height: usize, color_format: u32) -> Self {
-        assert!(buffer.len() == width * height * 4);
-
-        unsafe {
-            let mut id = 0;
-            gl::GenTextures(1, &mut id);
-            gl::BindTexture(gl::TEXTURE_2D, id);
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
-            gl::TexImage2D(
-                gl::TEXTURE_2D,
-                0,
-                color_format as i32,
-                width as i32,
-                height as i32,
-                0,
-                color_format,
-                gl::UNSIGNED_BYTE,
-                buffer.as_ptr() as *const _,
-            );
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
-            Self { id, width, height }
-        }
-    }
-
-    /// Delete this texture.
-    ///
-    /// Since texture IDs are context-specific, the context must be bound when
-    /// calling this function.
-    pub fn delete(&self) {
-        unsafe {
-            gl::DeleteTextures(1, &self.id);
-        }
+        (egl_surface, egl_context, egl_config)
     }
 }

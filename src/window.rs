@@ -4,6 +4,7 @@ use std::ptr::NonNull;
 
 use glutin::display::{Display, DisplayApiPreference};
 use raw_window_handle::{RawDisplayHandle, WaylandDisplayHandle};
+use skia_safe::Color4f;
 use smithay_client_toolkit::compositor::{CompositorState, Region};
 use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
 use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewport::WpViewport;
@@ -12,14 +13,17 @@ use smithay_client_toolkit::shell::wlr_layer::{Anchor, Layer, LayerSurface};
 
 use crate::geometry::Size;
 use crate::renderer::Renderer;
+use crate::skia::Canvas;
 use crate::wayland::ProtocolStates;
-use crate::{Error, State, gl};
+use crate::{Error, State};
 
 /// Wayland window.
 pub struct Window {
     surface: LayerSurface,
     viewport: WpViewport,
     renderer: Renderer,
+
+    canvas: Canvas,
 
     size: Size,
     scale: f64,
@@ -61,7 +65,14 @@ impl Window {
         }
         let viewport = protocol_states.viewporter.viewport(queue, wl_surface);
 
-        Ok(Self { viewport, renderer, surface, scale: 1., size: Default::default() })
+        Ok(Self {
+            viewport,
+            renderer,
+            surface,
+            scale: 1.,
+            canvas: Default::default(),
+            size: Default::default(),
+        })
     }
 
     /// Redraw the window.
@@ -78,9 +89,10 @@ impl Window {
 
         // Render the window content.
         let physical_size = self.size * self.scale;
-        self.renderer.draw(physical_size, |_| unsafe {
-            gl::ClearColor(1., 0., 1., 1.);
-            gl::Clear(gl::COLOR_BUFFER_BIT);
+        self.renderer.draw(physical_size, |renderer| {
+            self.canvas.draw(renderer.skia_config(), physical_size, |canvas| {
+                canvas.clear(Color4f::new(1., 0., 1., 1.));
+            });
         });
 
         // Apply surface changes.
