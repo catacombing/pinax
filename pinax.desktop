@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Pinax
+Exec=pinax
+Comment=Wayland mobile notepad
+Categories=Utility;TextTools
+Keywords=mobile;wayland
