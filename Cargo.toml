@@ -1,7 +1,7 @@
 [package]
 name = "pinax"
 version = "0.1.0"
-description = "Wayland layer shell notepad"
+description = "Wayland mobile notepad"
 authors = ["Christian Duerr <contact@christianduerr.com>"]
 repository = "https://github.com/catacombing/pinax"
 rust-version = "1.88.0"

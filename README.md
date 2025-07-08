@@ -1,7 +1,6 @@
 # Pinax
 
-Pinax is a simple layer shell application for keeping a small list of easily
-accessible notes on mobile Wayland systems.
+Pinax is a simple notes application for mobile Wayland systems.
 
 ## Configuration
 
