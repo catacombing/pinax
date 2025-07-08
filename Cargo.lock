@@ -161,9 +161,9 @@ dependencies = [
 
 [[package]]
 name = "configory"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24257562d92208dba73763b075ddcea32703c6f8cfc1087a67a215773a245a32"
+checksum = "6a0b0bf14aaabbec4f1f4fc5a3f138d705313d84189e64f9e82d797a2a831ed2"
 dependencies = [
  "configory_derive",
  "dirs",
@@ -178,9 +178,9 @@ dependencies = [
 
 [[package]]
 name = "configory_derive"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3957257b839ddcc8439cbf5789b21368d30327ef1d01a9bb95a77fb240e3821b"
+checksum = "1f81505e79b358115ada50fa8bcfb981a0f61c0b37c5c442ace16c9dd0b06f81"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -714,12 +714,14 @@ dependencies = [
  "calloop",
  "calloop-wayland-source",
  "configory",
+ "dirs",
  "gl_generator",
  "glutin",
  "raw-window-handle",
  "serde",
  "skia-safe",
  "smithay-client-toolkit",
+ "tempfile",
  "thiserror 2.0.12",
  "tracing",
  "tracing-subscriber",

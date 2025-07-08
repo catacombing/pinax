@@ -1,11 +1,14 @@
 //! Wayland window rendering.
 
-use std::io::Read;
+use std::io::{ErrorKind as IoErrorKind, Read, Write};
+use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::{cmp, mem};
+use std::time::{Duration, Instant};
+use std::{cmp, fs, mem};
 
 use _text_input::zwp_text_input_v3::{ChangeCause, ContentHint, ContentPurpose, ZwpTextInputV3};
-use calloop::LoopHandle;
+use calloop::timer::{TimeoutAction, Timer};
+use calloop::{LoopHandle, RegistrationToken};
 use glutin::display::{Display, DisplayApiPreference};
 use raw_window_handle::{RawDisplayHandle, WaylandDisplayHandle};
 use skia_safe::textlayout::{
@@ -20,7 +23,8 @@ use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_vie
 use smithay_client_toolkit::seat::keyboard::{Keysym, Modifiers};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::xdg::window::{Window as XdgWindow, WindowDecorations};
-use tracing::{error, warn};
+use tempfile::NamedTempFile;
+use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::geometry::{Position, Size};
@@ -404,6 +408,10 @@ pub struct TextBox {
     keyboard_focused: bool,
     ime_focused: bool,
 
+    persist_token: Option<RegistrationToken>,
+    persist_start: Option<Instant>,
+    storage_path: PathBuf,
+
     text_input_dirty: bool,
     dirty: bool,
 }
@@ -425,13 +433,28 @@ impl TextBox {
         let mut font_collection = FontCollection::new();
         font_collection.set_default_font_manager(FontMgr::new(), None);
 
+        // Read initial text from file.
+        let storage_path = config.general.storage_path();
+        let text = match fs::read_to_string(&storage_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == IoErrorKind::NotFound => String::new(),
+            Err(err) => {
+                error!("Failed to read from storage file: {err}");
+                String::new()
+            },
+        };
+        let cursor_index = text.len();
+
         Ok(Self {
             font_collection,
+            cursor_index,
+            storage_path,
             font_family,
             event_loop,
             text_style,
             font_size,
             paint,
+            text,
             text_input_dirty: true,
             dirty: true,
             scale: 1.,
@@ -440,12 +463,12 @@ impl TextBox {
             keyboard_focused: Default::default(),
             last_cursor_rect: Default::default(),
             last_paragraph: Default::default(),
-            cursor_index: Default::default(),
+            persist_start: Default::default(),
+            persist_token: Default::default(),
             preedit_text: Default::default(),
             ime_focused: Default::default(),
             touch_state: Default::default(),
             size: Default::default(),
-            text: Default::default(),
         })
     }
 
@@ -629,6 +652,7 @@ impl TextBox {
 
                 // Pop the character after the cursor.
                 self.text.remove(self.cursor_index);
+                self.persist_text();
 
                 self.text_input_dirty = true;
                 self.dirty = true;
@@ -641,6 +665,7 @@ impl TextBox {
                 // Pop character after the cursor.
                 if self.cursor_index < self.text.len() {
                     self.text.remove(self.cursor_index);
+                    self.persist_text();
                 }
 
                 self.text_input_dirty = true;
@@ -648,6 +673,7 @@ impl TextBox {
             },
             (Keysym::Return, false, false) => {
                 self.text.insert(self.cursor_index, '\n');
+                self.persist_text();
                 self.cursor_index += 1;
 
                 self.text_input_dirty = true;
@@ -698,6 +724,7 @@ impl TextBox {
                 if let Some(key_char) = keysym.key_char() {
                     // Add text at cursor position.
                     self.text.insert(self.cursor_index, key_char);
+                    self.persist_text();
 
                     // Move cursor behind inserted character.
                     self.cursor_index += key_char.len_utf8();
@@ -755,6 +782,7 @@ impl TextBox {
         } else {
             self.text.insert_str(self.cursor_index, text);
         }
+        self.persist_text();
 
         // Move cursor behind the new characters.
         self.cursor_index += text.len();
@@ -772,6 +800,7 @@ impl TextBox {
         // Remove all bytes in the range from the text.
         self.text.truncate(end);
         self.text = self.text.split_off(start);
+        self.persist_text();
 
         // Update cursor position.
         self.cursor_index = start;
@@ -842,6 +871,81 @@ impl TextBox {
             self.fallback_metrics = Some(fallback_font.metrics().1);
         }
         *self.fallback_metrics.as_ref().unwrap()
+    }
+
+    /// Persist current text content to disk.
+    ///
+    /// This is automatically debounced to avoid excessive write operations.
+    fn persist_text(&mut self) {
+        // Debounce periods before text is persisted to disk.
+        const MIN_DEBOUNCE: Duration = Duration::from_millis(1000);
+        const MAX_DEBOUNCE: Duration = Duration::from_millis(5000);
+
+        // Clear pending timers.
+        if let Some(token) = self.persist_token.take() {
+            self.event_loop.remove(token);
+        }
+
+        // Stage new persist timer, or write immediately if `MAX_DEBOUNCE` was reached.
+        let start = self.persist_start.get_or_insert_with(Instant::now);
+        let elapsed = start.elapsed();
+        if elapsed >= MAX_DEBOUNCE {
+            self.atomic_write();
+            self.persist_start = None;
+        } else {
+            let debounce = cmp::min(MIN_DEBOUNCE, MAX_DEBOUNCE - elapsed);
+            self.persist_token = self
+                .event_loop
+                .insert_source(Timer::from_duration(debounce), move |_, _, state| {
+                    state.window.text_box.atomic_write();
+                    TimeoutAction::Drop
+                })
+                .inspect_err(|err| error!("Failed to register write callback: {err}"))
+                .ok();
+        }
+    }
+
+    /// Attempt to atomically write a file.
+    fn atomic_write(&mut self) {
+        self.persist_start = None;
+
+        // Get storage directory.
+        let target_dir = match self.storage_path.parent() {
+            Some(parent) => parent,
+            None => {
+                error!("Storage path cannot be filesystem root");
+                return;
+            },
+        };
+
+        // Ensure parent directory exists.
+        if let Err(err) = fs::create_dir_all(target_dir) {
+            error!("Could not create parent directories: {err}");
+            return;
+        }
+
+        // Create a tempfile "next to" the target path.
+        //
+        // Creating this in the same directory as the target path should avoid errors
+        // due to persisting across filesystems.
+        let mut tempfile = match NamedTempFile::new_in(target_dir) {
+            Ok(tempfile) => tempfile,
+            Err(err) => {
+                error!("Failed to create temporary file: {err}");
+                return;
+            },
+        };
+
+        if let Err(err) = tempfile.write_all(self.text.as_bytes()) {
+            error!("Failed to write to temporary file: {err}");
+            return;
+        }
+
+        if let Err(err) = tempfile.persist(&self.storage_path) {
+            error!("Failed move of temporary file: {err}");
+        }
+
+        info!("Successfully saved notes");
     }
 }
 

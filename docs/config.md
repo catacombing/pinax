@@ -12,6 +12,14 @@ Pinax doesn't create the configuration file for you, but it looks for one at
 
 ## Fields
 
+### general
+
+This section documents the `[general]` table.
+
+|Name|Description|Type|Default|
+|-|-|-|-|
+|path|Location the notes are saved to|path|`${XDG_DATA_HOME:-$HOME/.local/share}/pinax/notes`|
+
 ### font
 
 This section documents the `[font]` table.

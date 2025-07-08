@@ -2,6 +2,7 @@
 
 use std::fmt::{self, Display, Formatter};
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use calloop::LoopHandle;
@@ -31,12 +32,30 @@ use crate::State;
 #[derive(Docgen, Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// This section documents the `[general]` table.
+    pub general: General,
     /// This section documents the `[font]` table.
     pub font: Font,
     /// This section documents the `[color]` table.
     pub colors: Colors,
     /// This section documents the `[input]` table.
     pub input: Input,
+}
+
+/// General configuration.
+#[derive(Docgen, Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct General {
+    /// Location the notes are saved to.
+    #[docgen(default = "${XDG_DATA_HOME:-$HOME/.local/share}/pinax/notes")]
+    path: Option<PathBuf>,
+}
+
+impl General {
+    /// Get the storage path.
+    pub fn storage_path(&self) -> PathBuf {
+        self.path.clone().unwrap_or_else(|| dirs::data_dir().unwrap().join("pinax/notes"))
+    }
 }
 
 /// Font configuration.
