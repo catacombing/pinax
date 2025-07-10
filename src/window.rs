@@ -975,7 +975,9 @@ impl TextBox {
             },
         };
 
-        if let Err(err) = tempfile.write_all(self.text.as_bytes()) {
+        // Write text with newline appended at the end.
+        let result = tempfile.write_all(self.text.as_bytes()).and_then(|_| tempfile.write(b"\n"));
+        if let Err(err) = result {
             error!("Failed to write to temporary file: {err}");
             return;
         }
