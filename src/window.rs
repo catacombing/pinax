@@ -35,8 +35,21 @@ use crate::skia::Canvas;
 use crate::wayland::ProtocolStates;
 use crate::{Error, State};
 
-/// Padding around the text box.
+/// Padding around the text box at scale 1.
 const PADDING: f64 = 15.;
+
+/// Size of the bullet points at scale 1.
+const BULLET_POINT_SIZE: f32 = 5.;
+
+/// Horizontal padding reserved for bullet points at scale 1.
+///
+/// This includes the space of the bullet point itself, so it should always be
+/// bigger than `BULLET_POINT_SIZE`.
+///
+/// It is not distributed around the bullet point evenly, but instead the bullet
+/// point is aligned to the left. This helps with balancing this setting and
+/// `PADDING`.
+const BULLET_POINT_PADDING: f32 = f32::max(BULLET_POINT_SIZE, 15.);
 
 /// Maximum number of surrounding bytes submitted to IME.
 ///
@@ -370,14 +383,16 @@ impl Window {
     /// Origin point of the text box.
     fn text_origin(&self) -> Position<f64> {
         let padding = (PADDING * self.scale).round();
-        Position::new(padding, padding)
+        let bullet_padding = (BULLET_POINT_PADDING as f64 * self.scale).round();
+        Position::new(padding + bullet_padding, padding)
     }
 
     /// Size of the text box.
     fn text_size(&self) -> Size {
         let physical_size = self.size * self.scale;
         let padding = (PADDING * self.scale).round() as u32;
-        physical_size - Size::new(padding * 2, padding * 2)
+        let bullet_padding = (BULLET_POINT_PADDING as f64 * self.scale).round() as u32;
+        physical_size - Size::new(padding * 2 + bullet_padding, padding * 2)
     }
 }
 
@@ -509,7 +524,35 @@ impl TextBox {
             point.y += self.size.height as f32 - self.last_paragraph_height;
             paragraph.paint(canvas, point);
 
+            // Add bullet points in front of list elements.
+            let bullet_lines = self
+                .text
+                .match_indices("\n\n")
+                .map(|(i, _)| paragraph.get_line_number_at(i).unwrap() + 2);
+            for line in bullet_lines.chain([0]) {
+                let metrics = paragraph.get_line_metrics_at(line).unwrap();
+                let size = BULLET_POINT_SIZE * self.scale as f32;
+                let y = point.y + metrics.baseline as f32 - metrics.ascent as f32 / 2.
+                    + metrics.descent as f32 / 2.
+                    - size / 2.;
+                let x = point.x - BULLET_POINT_PADDING * self.scale as f32;
+                let rect = Rect::new(x, y, x + size, y + size);
+                canvas.draw_rect(rect, &self.paint);
+            }
+
             self.last_paragraph = Some(paragraph);
+        } else {
+            // Anchor content to the bottom of the window.
+            let metrics = self.fallback_metrics();
+            self.last_paragraph_height = metrics.descent - metrics.ascent;
+            point.y += self.size.height as f32 - self.last_paragraph_height;
+
+            // Handle bullet point drawing without any text.
+            let size = BULLET_POINT_SIZE * self.scale as f32;
+            let y = point.y - metrics.ascent / 2. + metrics.descent / 2. - size / 2.;
+            let x = point.x - BULLET_POINT_PADDING * self.scale as f32;
+            let rect = Rect::new(x, y, x + size, y + size);
+            canvas.draw_rect(rect, &self.paint);
         }
 
         // Draw cursor while focused.
@@ -541,9 +584,6 @@ impl TextBox {
                 None => {
                     // Put cursor at the bottom of the screen.
                     let metrics = self.fallback_metrics();
-                    self.last_paragraph_height = metrics.descent - metrics.ascent;
-                    point.y += self.size.height as f32 - self.last_paragraph_height;
-
                     (point.x, -metrics.ascent as f64, -metrics.ascent, metrics.descent)
                 },
             };
@@ -579,6 +619,7 @@ impl TextBox {
         self.dirty = true;
 
         self.text_style.set_font_size(self.font_size());
+        self.fallback_metrics = None;
     }
 
     /// Set keyboard focus state.
