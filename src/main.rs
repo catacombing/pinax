@@ -59,7 +59,7 @@ fn run() -> Result<(), Error> {
 
     // Insert wayland source into calloop loop.
     let wayland_source = WaylandSource::new(connection, queue);
-    wayland_source.insert(event_loop.handle()).map_err(|err| err.error)?;
+    wayland_source.insert(event_loop.handle())?;
 
     // Start event loop.
     while !state.terminated {
@@ -273,4 +273,12 @@ enum Error {
     Configory(#[from] configory::Error),
     #[error("{0}")]
     Glutin(#[from] glutin::error::Error),
+    #[error("{0}")]
+    Notify(#[from] calloop_notify::notify::Error),
+}
+
+impl<T> From<calloop::InsertError<T>> for Error {
+    fn from(err: calloop::InsertError<T>) -> Self {
+        Self::EventLoop(err.error)
+    }
 }

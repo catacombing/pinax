@@ -9,6 +9,8 @@ use std::{cmp, fs, mem};
 use _text_input::zwp_text_input_v3::{ChangeCause, ContentHint, ContentPurpose, ZwpTextInputV3};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{LoopHandle, RegistrationToken};
+use calloop_notify::NotifySource;
+use calloop_notify::notify::{EventKind, RecursiveMode, Watcher};
 use glutin::display::{Display, DisplayApiPreference};
 use raw_window_handle::{RawDisplayHandle, WaylandDisplayHandle};
 use skia_safe::textlayout::{
@@ -435,15 +437,11 @@ impl TextBox {
 
         // Read initial text from file.
         let storage_path = config.general.storage_path();
-        let text = match fs::read_to_string(&storage_path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == IoErrorKind::NotFound => String::new(),
-            Err(err) => {
-                error!("Failed to read from storage file: {err}");
-                String::new()
-            },
-        };
+        let text = Self::read_to_string(&storage_path).unwrap_or_default();
         let cursor_index = text.len();
+
+        // Update text box on file change.
+        Self::monitor_file(&event_loop, storage_path.clone())?;
 
         Ok(Self {
             font_collection,
@@ -946,6 +944,81 @@ impl TextBox {
         }
 
         info!("Successfully saved notes");
+    }
+
+    /// Monitor storage path for file changes.
+    fn monitor_file(
+        event_loop: &LoopHandle<'static, State>,
+        storage_path: PathBuf,
+    ) -> Result<(), Error> {
+        let parent = match storage_path.parent() {
+            Some(parent) => parent,
+            None => {
+                error!("Storage path cannot be filesystem root");
+                return Ok(());
+            },
+        };
+
+        // Create new monitor for the parent directory.
+        let mut notify_source = NotifySource::new()?;
+        notify_source.watch(parent, RecursiveMode::Recursive)?;
+
+        // Watch for changes.
+        event_loop.insert_source(notify_source, move |event, _, state| {
+            // Ignore non-mutable events.
+            if let EventKind::Access(_) = event.kind {
+                return;
+            }
+
+            // Ignore other files in the storage directory.
+            if !event.paths.contains(&storage_path) {
+                return;
+            }
+
+            // Read file content.
+            let content = match Self::read_to_string(&storage_path) {
+                Some(content) => content,
+                None => return,
+            };
+
+            // Update input if text changed.
+            if state.window.text_box.text != content {
+                info!("Reloading updated storage file");
+
+                state.window.text_box.cursor_index = content.len();
+                state.window.text_box.text = content;
+
+                state.window.text_box.text_input_dirty = true;
+                state.window.text_box.dirty = true;
+
+                state.window.unstall();
+            }
+        })?;
+
+        Ok(())
+    }
+
+    /// Read storage file to a string.
+    ///
+    /// This will return `None` if the file does not exist or access was denied.
+    fn read_to_string(path: &PathBuf) -> Option<String> {
+        // Read file content.
+        let mut content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            // Ignore file removal, since it might be done for replacement.
+            Err(err) if err.kind() == IoErrorKind::NotFound => return None,
+            Err(err) => {
+                error!("Failed to read storage file at {path:?}: {err}");
+                return None;
+            },
+        };
+
+        // Strip trailing newline, commonly inserted by text editors.
+        if content.ends_with('\n') {
+            content.truncate(content.len() - 1);
+        }
+
+        Some(content)
     }
 }
 

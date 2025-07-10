@@ -89,6 +89,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "calloop-notify"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63062bae7dc60f18f4022801b55710f9816ceab5b2af2240e0ff9b8dbb8ebbf6"
+dependencies = [
+ "calloop",
+ "notify",
+]
+
+[[package]]
 name = "calloop-wayland-source"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -712,6 +722,7 @@ name = "pinax"
 version = "0.2.0"
 dependencies = [
  "calloop",
+ "calloop-notify",
  "calloop-wayland-source",
  "configory",
  "dirs",
