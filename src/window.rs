@@ -679,7 +679,7 @@ impl TextBox {
                 self.dirty = true;
             },
             (Keysym::BackSpace, false, false) => {
-                if self.text.is_empty() {
+                if self.text.is_empty() || self.cursor_index == 0 {
                     return;
                 }
 
