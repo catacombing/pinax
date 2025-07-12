@@ -47,8 +47,8 @@ pub struct TextBox {
     paint: Paint,
 
     last_paragraph: Option<Paragraph>,
-    last_paragraph_height: f32,
     last_cursor_rect: Option<Rect>,
+    last_paragraph_height: f32,
 
     preedit_text: String,
     text: String,
@@ -63,6 +63,7 @@ pub struct TextBox {
     font_size: f64,
 
     touch_state: TouchState,
+    scroll_offset: f32,
 
     keyboard_focused: bool,
     ime_focused: bool,
@@ -70,6 +71,8 @@ pub struct TextBox {
     persist_token: Option<RegistrationToken>,
     persist_start: Option<Instant>,
     storage_path: PathBuf,
+
+    focus_cursor: bool,
 
     text_input_dirty: bool,
     dirty: bool,
@@ -129,6 +132,8 @@ impl TextBox {
             last_paragraph: Default::default(),
             persist_start: Default::default(),
             persist_token: Default::default(),
+            scroll_offset: Default::default(),
+            focus_cursor: Default::default(),
             preedit_text: Default::default(),
             ime_focused: Default::default(),
             touch_state: Default::default(),
@@ -154,140 +159,176 @@ impl TextBox {
         self.dirty = false;
 
         // Render text if not empty.
-        self.last_paragraph = None;
         if !self.text.is_empty() || !self.preedit_text.is_empty() {
-            // Get selectior range, defaulting to an empty selection.
-            let selection = match self.selection.as_ref() {
-                Some(selection) => selection.start..selection.end,
-                None => self.text.len()..usize::MAX,
-            };
+            // Re-layout paragraph content.
+            self.update_paragraph();
 
-            // Create paragraph builder with the default text style.
-            let mut paragraph_style = ParagraphStyle::new();
-            paragraph_style.set_text_style(&self.text_style);
-            let mut paragraph_builder =
-                ParagraphBuilder::new(&paragraph_style, &self.font_collection);
-
-            // Draw text before the selection, or entire text without selection.
-            if selection.start > 0 {
-                paragraph_builder.add_text(&self.text[..selection.start]);
+            // Scroll to cursor, or clamp offset within maximum bounds.
+            if mem::take(&mut self.focus_cursor) {
+                unsafe { self.update_scroll_offset() };
+            } else {
+                unsafe { self.clamp_scroll_offset() };
             }
 
-            // Draw selection and text after it.
-            if selection.start < self.text.len() {
-                paragraph_builder.push_style(&self.selection_style);
-                paragraph_builder.add_text(&self.text[selection.start..selection.end]);
-
-                paragraph_builder.pop();
-                paragraph_builder.add_text(&self.text[selection.end..]);
-            }
-
-            // Add preedit text with underline.
-            if !self.preedit_text.is_empty() {
-                // Create style with reduced text brightness and underline.
-                let color = Color4f { a: 0.6, ..self.paint.color4f() };
-                self.paint.set_color4f(color, None);
-                let mut text_style = self.text_style.clone();
-                text_style.set_decoration_type(TextDecoration::UNDERLINE);
-                text_style.set_foreground_paint(&self.paint);
-
-                // Add styled text to the paragraph.
-                paragraph_builder.push_style(&text_style);
-                paragraph_builder.add_text(&self.preedit_text);
-            }
-
-            // Build paragraph and calculate its height.
-            let mut paragraph = paragraph_builder.build();
-            paragraph.layout(self.size.width as f32);
-            self.last_paragraph_height = paragraph.height();
+            let paragraph = self.last_paragraph.as_ref().unwrap();
 
             // Render text.
-            point.y += self.size.height as f32 - self.last_paragraph_height;
+            point.y += (self.size.height as f32 - self.last_paragraph_height).max(0.);
+            point.y += self.scroll_offset;
             paragraph.paint(canvas, point);
 
-            // Add bullet points in front of list elements.
-            let mut consecutive_newlines = 2;
-            for (i, c) in self.text.char_indices() {
-                if c == '\n' {
-                    consecutive_newlines += 1;
-                    continue;
-                } else if c.is_whitespace() {
-                    continue;
-                }
-
-                // Draw bullet points after at least one empty line.
-                if consecutive_newlines >= 2 {
-                    // Get metrics of the first character in the line.
-                    let line = paragraph.get_line_number_at(i).unwrap();
-                    let metrics = paragraph.get_line_metrics_at(line).unwrap();
-
-                    // Draw rectangle in the padding area.
-                    let size = BULLET_POINT_SIZE * self.scale as f32;
-                    let y = point.y + metrics.baseline as f32 - metrics.ascent as f32 / 2.
-                        + metrics.descent as f32 / 2.
-                        - size / 2.;
-                    let x = point.x - BULLET_POINT_PADDING * self.scale as f32;
-                    let rect = Rect::new(x, y, x + size, y + size);
-                    canvas.draw_rect(rect, &self.paint);
-                }
-
-                consecutive_newlines = 0;
-            }
-
-            self.last_paragraph = Some(paragraph);
+            // Draw list element bullet points.
+            self.draw_bullet_points(canvas, point);
         } else {
-            // Anchor content to the bottom of the window.
+            // Reset scroll offset if there is no text.
+            self.scroll_offset = 0.;
+
+            // Calculate approximate line height.
             let metrics = self.fallback_metrics();
             self.last_paragraph_height = metrics.descent - metrics.ascent;
-            point.y += self.size.height as f32 - self.last_paragraph_height;
+            self.last_paragraph = None;
 
-            // Handle bullet point drawing without any text.
-            let size = BULLET_POINT_SIZE * self.scale as f32;
-            let y = point.y - metrics.ascent / 2. + metrics.descent / 2. - size / 2.;
-            let x = point.x - BULLET_POINT_PADDING * self.scale as f32;
-            let rect = Rect::new(x, y, x + size, y + size);
-            canvas.draw_rect(rect, &self.paint);
+            // Anchor content to the bottom of the window.
+            point.y += (self.size.height as f32 - self.last_paragraph_height).max(0.);
+
+            // Draw list element bullet points.
+            self.draw_bullet_points(canvas, point);
         }
 
         // Draw cursor or selection carets while focused.
-        self.last_cursor_rect = None;
-        if self.keyboard_focused || self.ime_focused {
-            match self.selection {
-                Some(Range { start, end }) => {
-                    // Draw caret at the selection start.
-                    let (start_points, line_height) = self.caret_points(point, start);
-                    let start_path = Path::polygon(&start_points, true, None, true);
-                    canvas.draw_path(&start_path, &self.paint);
+        self.last_cursor_rect =
+            (self.keyboard_focused || self.ime_focused).then(|| self.draw_cursor(canvas, point));
+    }
 
-                    // Draw caret at the selection end.
-                    let (end_points, _) = self.caret_points(point, end);
-                    let end_path = Path::polygon(&end_points, true, None, true);
-                    canvas.draw_path(&end_path, &self.paint);
+    /// Draw input or selection cursors.
+    fn draw_cursor(&mut self, canvas: &SkiaCanvas, point: Point) -> Rect {
+        match self.selection {
+            Some(Range { start, end }) => {
+                // Draw caret at the selection start.
+                let (start_points, line_height) = self.caret_points(point, start);
+                let start_path = Path::polygon(&start_points, true, None, true);
+                canvas.draw_path(&start_path, &self.paint);
 
-                    // Use entire selection as IME cursor rectangle.
-                    let start = start_points[2];
-                    let end = end_points[2];
-                    let rect = Rect::new(start.x, start.y, end.x, end.y + line_height);
-                    self.last_cursor_rect = Some(rect);
-                },
-                None => {
-                    // Get metrics at cursor position.
-                    let metrics = self.metrics_at(self.cursor_index);
+                // Draw caret at the selection end.
+                let (end_points, _) = self.caret_points(point, end);
+                let end_path = Path::polygon(&end_points, true, None, true);
+                canvas.draw_path(&end_path, &self.paint);
 
-                    // Calculate cursor bounding box.
-                    let x = point.x + metrics.x;
-                    let y = point.y + metrics.baseline - metrics.ascent;
-                    let width = self.scale.round() as f32;
-                    let height = (metrics.ascent + metrics.descent).round();
+                // Use entire selection as IME cursor rectangle.
+                let start = start_points[2];
+                let end = end_points[2];
+                Rect::new(start.x, start.y, end.x, end.y + line_height)
+            },
+            None => {
+                // Get metrics at cursor position.
+                let metrics = self.metrics_at(self.cursor_index);
 
-                    // Render the cursor rectangle.
-                    let rect = Rect::new(x, y, x + width, y + height);
-                    canvas.draw_rect(rect, &self.paint);
+                // Calculate cursor bounding box.
+                let x = point.x + metrics.x;
+                let y = point.y + metrics.baseline - metrics.ascent;
+                let width = self.scale.round() as f32;
+                let height = (metrics.ascent + metrics.descent).round();
 
-                    self.last_cursor_rect = Some(rect);
-                },
-            }
+                // Render the cursor rectangle.
+                let rect = Rect::new(x, y, x + width, y + height);
+                canvas.draw_rect(rect, &self.paint);
+
+                rect
+            },
         }
+    }
+
+    /// Draw list bullet points.
+    fn draw_bullet_points(&mut self, canvas: &SkiaCanvas, origin: Point) {
+        match self.last_paragraph.as_ref() {
+            Some(paragraph) => {
+                // Add bullet points in front of list elements.
+                let mut consecutive_newlines = 2;
+                for (i, c) in self.text.char_indices() {
+                    if c == '\n' {
+                        consecutive_newlines += 1;
+                        continue;
+                    } else if c.is_whitespace() {
+                        continue;
+                    }
+
+                    // Draw bullet points after at least one empty line.
+                    if consecutive_newlines >= 2 {
+                        // Get metrics of the first character in the line.
+                        let line = paragraph.get_line_number_at(i).unwrap();
+                        let metrics = paragraph.get_line_metrics_at(line).unwrap();
+
+                        // Draw rectangle in the padding area.
+                        let size = BULLET_POINT_SIZE * self.scale as f32;
+                        let y = origin.y + metrics.baseline as f32 - metrics.ascent as f32 / 2.
+                            + metrics.descent as f32 / 2.
+                            - size / 2.;
+                        let x = origin.x - BULLET_POINT_PADDING * self.scale as f32;
+                        let rect = Rect::new(x, y, x + size, y + size);
+                        canvas.draw_rect(rect, &self.paint);
+                    }
+
+                    consecutive_newlines = 0;
+                }
+            },
+            None => {
+                // Handle bullet point drawing without any text.
+                let size = BULLET_POINT_SIZE * self.scale as f32;
+                let y = origin.y + self.last_paragraph_height / 2. - size / 2.;
+                let x = origin.x - BULLET_POINT_PADDING * self.scale as f32;
+                let rect = Rect::new(x, y, x + size, y + size);
+                canvas.draw_rect(rect, &self.paint);
+            },
+        }
+    }
+
+    /// Update the text paragraph layout.
+    fn update_paragraph(&mut self) {
+        // Get selection range, defaulting to an empty selection.
+        let selection = match self.selection.as_ref() {
+            Some(selection) => selection.start..selection.end,
+            None => self.text.len()..usize::MAX,
+        };
+
+        // Create paragraph builder with the default text style.
+        let mut paragraph_style = ParagraphStyle::new();
+        paragraph_style.set_text_style(&self.text_style);
+        let mut paragraph_builder = ParagraphBuilder::new(&paragraph_style, &self.font_collection);
+
+        // Draw text before the selection, or entire text without selection.
+        if selection.start > 0 {
+            paragraph_builder.add_text(&self.text[..selection.start]);
+        }
+
+        // Draw selection and text after it.
+        if selection.start < self.text.len() {
+            paragraph_builder.push_style(&self.selection_style);
+            paragraph_builder.add_text(&self.text[selection.start..selection.end]);
+
+            paragraph_builder.pop();
+            paragraph_builder.add_text(&self.text[selection.end..]);
+        }
+
+        // Add preedit text with underline.
+        if !self.preedit_text.is_empty() {
+            // Create style with reduced text brightness and underline.
+            let color = Color4f { a: 0.6, ..self.paint.color4f() };
+            self.paint.set_color4f(color, None);
+            let mut text_style = self.text_style.clone();
+            text_style.set_decoration_type(TextDecoration::UNDERLINE);
+            text_style.set_foreground_paint(&self.paint);
+
+            // Add styled text to the paragraph.
+            paragraph_builder.push_style(&text_style);
+            paragraph_builder.add_text(&self.preedit_text);
+        }
+
+        // Build paragraph and calculate its height.
+        let mut paragraph = paragraph_builder.build();
+        paragraph.layout(self.size.width as f32);
+
+        self.last_paragraph_height = paragraph.height();
+        self.last_paragraph = Some(paragraph);
     }
 
     /// Set the text box's physical size.
@@ -295,8 +336,12 @@ impl TextBox {
         if self.size == size {
             return;
         }
-        self.dirty = true;
         self.size = size;
+
+        // Ensure cursor is visible after resize.
+        self.focus_cursor = true;
+
+        self.dirty = true;
     }
 
     /// Set the text box's font scale.
@@ -356,6 +401,7 @@ impl TextBox {
     /// Replace the entire text box content.
     pub fn set_text(&mut self, text: String) {
         self.cursor_index = text.len();
+        self.focus_cursor = true;
         self.text = text;
 
         self.clear_selection();
@@ -370,6 +416,9 @@ impl TextBox {
         if modifiers.logo || modifiers.alt {
             return;
         }
+
+        // Ensure cursor is visible after keyboard input.
+        self.focus_cursor = true;
 
         match (keysym, modifiers.shift, modifiers.ctrl) {
             (Keysym::Left, false, false) => {
@@ -515,7 +564,7 @@ impl TextBox {
     /// Handle touch press events.
     pub fn touch_down(&mut self, config: &Config, time: u32, mut position: Position<f64>) {
         // Adjust for text box being anchored to the bottom.
-        position.y -= self.size.height as f64 - self.last_paragraph_height as f64;
+        position.y -= (self.size.height as f64 - self.last_paragraph_height as f64).max(0.);
 
         let offset = self.offset_at(position).unwrap_or(0);
         self.touch_state.down(config, time, position, offset);
@@ -524,37 +573,48 @@ impl TextBox {
     /// Handle touch release.
     pub fn touch_motion(&mut self, config: &Config, mut position: Position<f64>) {
         // Adjust for text box being anchored to the bottom.
-        position.y -= self.size.height as f64 - self.last_paragraph_height as f64;
+        position.y -= (self.size.height as f64 - self.last_paragraph_height as f64).max(0.);
 
-        self.touch_state.motion(config, position, self.selection.as_ref());
+        let delta = self.touch_state.motion(config, position, self.selection.as_ref());
 
         // Handle touch drag actions.
-        if let TouchAction::DragSelectionStart | TouchAction::DragSelectionEnd =
-            self.touch_state.action
-        {
-            let offset = self.offset_at(position).unwrap_or(0);
-            let selection = self.selection.as_mut().unwrap();
+        match self.touch_state.action {
+            TouchAction::Drag => {
+                self.scroll_offset += delta.y as f32;
 
-            // Update selection if it is at least one character wide.
-            let modifies_start = self.touch_state.action == TouchAction::DragSelectionStart;
-            if modifies_start && offset != selection.end {
-                selection.start = offset;
-            } else if !modifies_start && offset != selection.start {
-                selection.end = offset;
-            }
+                self.text_input_dirty = true;
+                self.dirty = true;
+            },
+            TouchAction::DragSelectionStart | TouchAction::DragSelectionEnd => {
+                let offset = self.offset_at(position).unwrap_or(0);
+                let selection = self.selection.as_mut().unwrap();
 
-            // Swap modified side when input carets "overtake" each other.
-            if selection.start > selection.end {
-                mem::swap(&mut selection.start, &mut selection.end);
-                self.touch_state.action = if modifies_start {
-                    TouchAction::DragSelectionEnd
-                } else {
-                    TouchAction::DragSelectionStart
-                };
-            }
+                // Update selection if it is at least one character wide.
+                let modifies_start = self.touch_state.action == TouchAction::DragSelectionStart;
+                if modifies_start && offset != selection.end {
+                    selection.start = offset;
+                } else if !modifies_start && offset != selection.start {
+                    selection.end = offset;
+                }
 
-            self.text_input_dirty = true;
-            self.dirty = true;
+                // Swap modified side when input carets "overtake" each other.
+                if selection.start > selection.end {
+                    mem::swap(&mut selection.start, &mut selection.end);
+                    self.touch_state.action = if modifies_start {
+                        TouchAction::DragSelectionEnd
+                    } else {
+                        TouchAction::DragSelectionStart
+                    };
+                }
+
+                // Ensure cursor is visible after selection change.
+                self.focus_cursor = true;
+
+                self.text_input_dirty = true;
+                self.dirty = true;
+            },
+            // Ignore touch motion for tap actions.
+            _ => (),
         }
     }
 
@@ -575,6 +635,7 @@ impl TextBox {
         match self.touch_state.action {
             TouchAction::Tap => {
                 self.cursor_index = self.offset_at(position).unwrap_or(0);
+                self.focus_cursor = true;
 
                 self.clear_selection();
 
@@ -628,6 +689,7 @@ impl TextBox {
 
         // Move cursor behind the new characters.
         self.cursor_index += text.len();
+        self.focus_cursor = true;
 
         self.text_input_dirty = true;
         self.dirty = true;
@@ -646,6 +708,7 @@ impl TextBox {
 
         // Update cursor position.
         self.cursor_index = start;
+        self.focus_cursor = true;
 
         self.text_input_dirty = true;
         self.dirty = true;
@@ -666,6 +729,8 @@ impl TextBox {
         }
 
         self.preedit_text = text;
+        self.focus_cursor = true;
+
         self.dirty = true;
     }
 
@@ -694,6 +759,9 @@ impl TextBox {
 
         if start < end {
             self.selection = Some(start..end);
+
+            // Ensure cursor is visible after selection change.
+            self.focus_cursor = true;
 
             self.text_input_dirty = true;
             self.dirty = true;
@@ -726,6 +794,7 @@ impl TextBox {
 
         // Update cursor.
         self.cursor_index = selection.start;
+        self.focus_cursor = true;
 
         self.text_input_dirty = true;
         self.dirty = true;
@@ -733,6 +802,11 @@ impl TextBox {
 
     /// Get byte index at the specified position.
     fn offset_at(&self, point: impl Into<Point>) -> Option<usize> {
+        // Get position independent from current scroll offset.
+        let mut point = point.into();
+        point.y -= self.scroll_offset;
+
+        // Translate position to byte index.
         let paragraph = self.last_paragraph.as_ref()?;
         let position = match paragraph.get_glyph_position_at_coordinate(point) {
             PositionWithAffinity { affinity: Affinity::Upstream, position } => position as usize,
@@ -745,6 +819,7 @@ impl TextBox {
                 offset
             },
         };
+
         Some(position)
     }
 
@@ -752,17 +827,19 @@ impl TextBox {
     fn metrics_at(&mut self, offset: usize) -> GlyphMetrics {
         match &self.last_paragraph {
             Some(paragraph) if offset > 0 => {
-                let line_number = paragraph.get_line_number_at(offset - 1).unwrap();
+                let line_number = paragraph.get_line_number_at(offset - 1).unwrap_or(0);
 
                 // Newlines are zerowidth glyphs at the end of the line, so we have to manually
                 // move the cursor to the start of the following line.
-                let (x, metrics) = if self.text.as_bytes()[offset - 1] == b'\n' {
-                    let metrics = paragraph.get_line_metrics_at(line_number + 1).unwrap();
+                let (x, metrics) = if self.text.as_bytes()[offset - 1] == b'\n'
+                    && let Some(metrics) = paragraph.get_line_metrics_at(line_number + 1)
+                {
                     (0., metrics)
                 } else {
                     let metrics = paragraph.get_line_metrics_at(line_number).unwrap();
-                    let cluster = paragraph.get_glyph_cluster_at(offset - 1).unwrap();
-                    (cluster.bounds.right, metrics)
+                    let cluster = paragraph.get_glyph_cluster_at(offset - 1);
+                    let x = cluster.map_or(0., |cluster| cluster.bounds.right);
+                    (x, metrics)
                 };
 
                 GlyphMetrics::from_line_metrics(x, metrics)
@@ -981,6 +1058,60 @@ impl TextBox {
     /// Get the current font size.
     fn font_size(&self) -> f32 {
         (self.font_size * self.scale) as f32
+    }
+
+    /// Update the scroll offset based on cursor position.
+    ///
+    /// This will scroll towards the cursor to ensure it is always visible.
+    ///
+    /// # Safety
+    ///
+    /// This updates the scroll offset based on the last paragraph, so calling
+    /// it when `self.text` is changed from when `self.last_paragraph` was
+    /// rendered will lead to invalid scroll offsets.
+    unsafe fn update_scroll_offset(&mut self) {
+        match self.selection.as_ref() {
+            // For selections we jump twice, to make both ends visible if possible.
+            Some(&Range { start, end }) => {
+                unsafe { self.update_scroll_offset_to(start) };
+                unsafe { self.update_scroll_offset_to(end) };
+            },
+            None => unsafe { self.update_scroll_offset_to(self.cursor_index) },
+        }
+    }
+
+    /// Update the scroll offset to include a specific text byte offset.
+    ///
+    /// # Safety
+    ///
+    /// This updates the scroll offset based on the last paragraph, so calling
+    /// it when `self.text` is changed from when `self.last_paragraph` was
+    /// rendered will lead to invalid scroll offsets.
+    unsafe fn update_scroll_offset_to(&mut self, offset: usize) {
+        let metrics = self.metrics_at(offset);
+        let line_end = metrics.baseline + metrics.descent;
+
+        // Scroll cursor back into the visible range.
+        let delta = line_end + self.scroll_offset - self.size.height as f32;
+        if delta > 0. {
+            self.scroll_offset -= delta;
+        } else if line_end + self.scroll_offset < 0. {
+            self.scroll_offset = -line_end;
+        }
+
+        unsafe { self.clamp_scroll_offset() };
+    }
+
+    /// Clamp the scroll offset to the text area's limits.
+    ///
+    /// # Safety
+    ///
+    /// This updates the scroll offset based on the last paragraph height, so
+    /// calling it when `self.text` does not match the text used for calculating
+    /// `self.last_paragraph_height` will lead to invalid scroll offsets.
+    unsafe fn clamp_scroll_offset(&mut self) {
+        let min_offset = -(self.last_paragraph_height - self.size.height as f32).max(0.);
+        self.scroll_offset = self.scroll_offset.min(0.).max(min_offset);
     }
 }
 
