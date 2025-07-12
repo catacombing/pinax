@@ -1,5 +1,6 @@
 //! Text input area.
 
+use std::f32::consts::SQRT_2;
 use std::io::{ErrorKind as IoErrorKind, Read, Write};
 use std::ops::{Bound, Range, RangeBounds};
 use std::path::PathBuf;
@@ -27,7 +28,10 @@ use crate::window::{BULLET_POINT_PADDING, BULLET_POINT_SIZE};
 use crate::{Error, State};
 
 // Selection caret size at scale 1.
-const CARET_SIZE: f64 = 7.;
+const CARET_SIZE: f64 = 5.;
+
+// Caret outline width at scale 1.
+const CARET_STROKE: f64 = 3.;
 
 /// Maximum number of surrounding bytes submitted to IME.
 ///
@@ -93,6 +97,7 @@ impl TextBox {
         text_style.set_font_families(&[&font_family]);
 
         let mut selection_paint = paint.clone();
+        selection_paint.set_stroke_width(CARET_STROKE as f32);
         let mut selection_style = text_style.clone();
         selection_paint.set_color4f(config.colors.background.as_color4f(), None);
         selection_style.set_foreground_paint(&selection_paint);
@@ -204,15 +209,21 @@ impl TextBox {
     fn draw_cursor(&mut self, canvas: &SkiaCanvas, point: Point) -> Rect {
         match self.selection {
             Some(Range { start, end }) => {
-                // Draw caret at the selection start.
+                // Get points required for drawing the triangles.
                 let (start_points, line_height) = self.caret_points(point, start);
                 let start_path = Path::polygon(&start_points, true, None, true);
-                canvas.draw_path(&start_path, &self.selection_paint);
-
-                // Draw caret at the selection end.
                 let (end_points, _) = self.caret_points(point, end);
                 let end_path = Path::polygon(&end_points, true, None, true);
+
+                // Draw the caret outlines.
+                self.selection_paint.set_stroke(true);
+                canvas.draw_path(&start_path, &self.selection_paint);
                 canvas.draw_path(&end_path, &self.selection_paint);
+                self.selection_paint.set_stroke(false);
+
+                // Draw the center/background.
+                canvas.draw_path(&start_path, &self.selection_style.foreground());
+                canvas.draw_path(&end_path, &self.selection_style.foreground());
 
                 // Use entire selection as IME cursor rectangle.
                 let start = start_points[2];
@@ -352,6 +363,7 @@ impl TextBox {
         self.scale = scale;
         self.dirty = true;
 
+        self.selection_paint.set_stroke_width(self.stroke_size());
         self.selection_style.set_font_size(self.font_size());
         self.text_style.set_font_size(self.font_size());
         self.fallback_metrics = None;
@@ -856,7 +868,10 @@ impl TextBox {
         let caret_size = (CARET_SIZE * self.scale).round() as f32;
         let metrics = self.metrics_at(index);
 
-        let y = metrics.baseline - metrics.ascent;
+        // Calculate width of the triangle outline at the tip.
+        let stroke_point_width = SQRT_2 * self.stroke_size();
+
+        let y = metrics.baseline - metrics.ascent - stroke_point_width / 2.;
         let line_height = metrics.ascent + metrics.descent;
 
         let points = [
@@ -1057,6 +1072,11 @@ impl TextBox {
     /// Get the current font size.
     fn font_size(&self) -> f32 {
         (self.font_size * self.scale) as f32
+    }
+
+    /// Get the current caret stroke size.
+    fn stroke_size(&self) -> f32 {
+        (CARET_STROKE * self.scale) as f32
     }
 
     /// Update the scroll offset based on cursor position.
