@@ -207,12 +207,12 @@ impl TextBox {
                 // Draw caret at the selection start.
                 let (start_points, line_height) = self.caret_points(point, start);
                 let start_path = Path::polygon(&start_points, true, None, true);
-                canvas.draw_path(&start_path, &self.paint);
+                canvas.draw_path(&start_path, &self.selection_paint);
 
                 // Draw caret at the selection end.
                 let (end_points, _) = self.caret_points(point, end);
                 let end_path = Path::polygon(&end_points, true, None, true);
-                canvas.draw_path(&end_path, &self.paint);
+                canvas.draw_path(&end_path, &self.selection_paint);
 
                 // Use entire selection as IME cursor rectangle.
                 let start = start_points[2];
