@@ -563,19 +563,32 @@ impl TextBox {
             paragraph.paint(canvas, point);
 
             // Add bullet points in front of list elements.
-            let bullet_lines = self
-                .text
-                .match_indices("\n\n")
-                .map(|(i, _)| paragraph.get_line_number_at(i).unwrap() + 2);
-            for line in bullet_lines.chain([0]) {
-                let metrics = paragraph.get_line_metrics_at(line).unwrap();
-                let size = BULLET_POINT_SIZE * self.scale as f32;
-                let y = point.y + metrics.baseline as f32 - metrics.ascent as f32 / 2.
-                    + metrics.descent as f32 / 2.
-                    - size / 2.;
-                let x = point.x - BULLET_POINT_PADDING * self.scale as f32;
-                let rect = Rect::new(x, y, x + size, y + size);
-                canvas.draw_rect(rect, &self.paint);
+            let mut consecutive_newlines = 2;
+            for (i, c) in self.text.char_indices() {
+                if c == '\n' {
+                    consecutive_newlines += 1;
+                    continue;
+                } else if c.is_whitespace() {
+                    continue;
+                }
+
+                // Draw bullet points after at least one empty line.
+                if consecutive_newlines >= 2 {
+                    // Get metrics of the first character in the line.
+                    let line = paragraph.get_line_number_at(i).unwrap();
+                    let metrics = paragraph.get_line_metrics_at(line).unwrap();
+
+                    // Draw rectangle in the padding area.
+                    let size = BULLET_POINT_SIZE * self.scale as f32;
+                    let y = point.y + metrics.baseline as f32 - metrics.ascent as f32 / 2.
+                        + metrics.descent as f32 / 2.
+                        - size / 2.;
+                    let x = point.x - BULLET_POINT_PADDING * self.scale as f32;
+                    let rect = Rect::new(x, y, x + size, y + size);
+                    canvas.draw_rect(rect, &self.paint);
+                }
+
+                consecutive_newlines = 0;
             }
 
             self.last_paragraph = Some(paragraph);
