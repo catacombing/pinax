@@ -1,6 +1,7 @@
 //! Wayland window rendering.
 
 use std::io::{ErrorKind as IoErrorKind, Read, Write};
+use std::ops::{Bound, Range, RangeBounds};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
@@ -14,10 +15,12 @@ use calloop_notify::notify::{EventKind, RecursiveMode, Watcher};
 use glutin::display::{Display, DisplayApiPreference};
 use raw_window_handle::{RawDisplayHandle, WaylandDisplayHandle};
 use skia_safe::textlayout::{
-    Affinity, FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, PositionWithAffinity,
-    TextDecoration, TextStyle,
+    Affinity, FontCollection, LineMetrics, Paragraph, ParagraphBuilder, ParagraphStyle,
+    PositionWithAffinity, TextDecoration, TextStyle,
 };
-use skia_safe::{Canvas as SkiaCanvas, Color4f, Font, FontMetrics, FontMgr, Paint, Point, Rect};
+use skia_safe::{
+    Canvas as SkiaCanvas, Color4f, Font, FontMetrics, FontMgr, Paint, Path, Point, Rect,
+};
 use smithay_client_toolkit::compositor::{CompositorState, Region};
 use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
 use smithay_client_toolkit::reexports::protocols::wp::text_input::zv3::client as _text_input;
@@ -50,6 +53,9 @@ const BULLET_POINT_SIZE: f32 = 5.;
 /// point is aligned to the left. This helps with balancing this setting and
 /// `PADDING`.
 const BULLET_POINT_PADDING: f32 = f32::max(BULLET_POINT_SIZE, 15.);
+
+// Selection caret size at scale 1.
+const CARET_SIZE: f64 = 7.;
 
 /// Maximum number of surrounding bytes submitted to IME.
 ///
@@ -353,8 +359,8 @@ impl Window {
 
         text_input.enable();
 
-        let (text, cursor) = self.text_box.surrounding_text(MAX_SURROUNDING_BYTES);
-        text_input.set_surrounding_text(text, cursor as i32, cursor as i32);
+        let (text, cursor_start, cursor_end) = self.text_box.surrounding_text();
+        text_input.set_surrounding_text(text, cursor_start, cursor_end);
 
         let cause = self.ime_cause.take().unwrap_or(ChangeCause::InputMethod);
         text_input.set_text_change_cause(cause);
@@ -402,7 +408,9 @@ pub struct TextBox {
 
     fallback_metrics: Option<FontMetrics>,
     font_collection: FontCollection,
+    selection_style: TextStyle,
     text_style: TextStyle,
+    selection_paint: Paint,
     paint: Paint,
 
     last_paragraph: Option<Paragraph>,
@@ -412,6 +420,7 @@ pub struct TextBox {
     preedit_text: String,
     text: String,
 
+    selection: Option<Range<usize>>,
     cursor_index: usize,
 
     size: Size,
@@ -447,6 +456,13 @@ impl TextBox {
         text_style.set_font_size(font_size as f32);
         text_style.set_font_families(&[&font_family]);
 
+        let mut selection_paint = paint.clone();
+        let mut selection_style = text_style.clone();
+        selection_paint.set_color4f(config.colors.background.as_color4f(), None);
+        selection_style.set_foreground_paint(&selection_paint);
+        selection_paint.set_color4f(config.colors.highlight.as_color4f(), None);
+        selection_style.set_background_paint(&selection_paint);
+
         let mut font_collection = FontCollection::new();
         font_collection.set_default_font_manager(FontMgr::new(), None);
 
@@ -460,6 +476,8 @@ impl TextBox {
 
         Ok(Self {
             font_collection,
+            selection_paint,
+            selection_style,
             cursor_index,
             storage_path,
             font_family,
@@ -481,6 +499,7 @@ impl TextBox {
             preedit_text: Default::default(),
             ime_focused: Default::default(),
             touch_state: Default::default(),
+            selection: Default::default(),
             size: Default::default(),
         })
     }
@@ -494,12 +513,31 @@ impl TextBox {
         // Render text if not empty.
         self.last_paragraph = None;
         if !self.text.is_empty() || !self.preedit_text.is_empty() {
-            // Shape text into paragraph.
+            // Get selectior range, defaulting to an empty selection.
+            let selection = match self.selection.as_ref() {
+                Some(selection) => selection.start..selection.end,
+                None => self.text.len()..usize::MAX,
+            };
+
+            // Create paragraph builder with the default text style.
             let mut paragraph_style = ParagraphStyle::new();
             paragraph_style.set_text_style(&self.text_style);
             let mut paragraph_builder =
-                ParagraphBuilder::new(&paragraph_style, self.font_collection.clone());
-            paragraph_builder.add_text(self.text.clone());
+                ParagraphBuilder::new(&paragraph_style, &self.font_collection);
+
+            // Draw text before the selection, or entire text without selection.
+            if selection.start > 0 {
+                paragraph_builder.add_text(&self.text[..selection.start]);
+            }
+
+            // Draw selection and text after it.
+            if selection.start < self.text.len() {
+                paragraph_builder.push_style(&self.selection_style);
+                paragraph_builder.add_text(&self.text[selection.start..selection.end]);
+
+                paragraph_builder.pop();
+                paragraph_builder.add_text(&self.text[selection.end..]);
+            }
 
             // Add preedit text with underline.
             if !self.preedit_text.is_empty() {
@@ -512,7 +550,7 @@ impl TextBox {
 
                 // Add styled text to the paragraph.
                 paragraph_builder.push_style(&text_style);
-                paragraph_builder.add_text(self.preedit_text.clone());
+                paragraph_builder.add_text(&self.preedit_text);
             }
 
             // Build paragraph and calculate its height.
@@ -555,49 +593,44 @@ impl TextBox {
             canvas.draw_rect(rect, &self.paint);
         }
 
-        // Draw cursor while focused.
+        // Draw cursor or selection carets while focused.
         self.last_cursor_rect = None;
         if self.keyboard_focused || self.ime_focused {
-            // Get metrics at cursor position.
-            let (x, baseline, ascent, descent) = match &self.last_paragraph {
-                Some(paragraph) if self.cursor_index > 0 => {
-                    let line_number = paragraph.get_line_number_at(self.cursor_index - 1).unwrap();
+            match self.selection {
+                Some(Range { start, end }) => {
+                    // Draw caret at the selection start.
+                    let (start_points, line_height) = self.caret_points(point, start);
+                    let start_path = Path::polygon(&start_points, true, None, true);
+                    canvas.draw_path(&start_path, &self.paint);
 
-                    // Newlines are zerowidth glyphs at the end of the line, so we have to manually
-                    // move the cursor to the start of the following line.
-                    let (x, metrics) = if self.text.as_bytes()[self.cursor_index - 1] == b'\n' {
-                        let metrics = paragraph.get_line_metrics_at(line_number + 1).unwrap();
-                        (point.x, metrics)
-                    } else {
-                        let metrics = paragraph.get_line_metrics_at(line_number).unwrap();
-                        let cluster =
-                            paragraph.get_glyph_cluster_at(self.cursor_index - 1).unwrap();
-                        (point.x + cluster.bounds.right, metrics)
-                    };
+                    // Draw caret at the selection end.
+                    let (end_points, _) = self.caret_points(point, end);
+                    let end_path = Path::polygon(&end_points, true, None, true);
+                    canvas.draw_path(&end_path, &self.paint);
 
-                    (x, metrics.baseline, metrics.ascent as f32, metrics.descent as f32)
-                },
-                Some(paragraph) => {
-                    let metrics = paragraph.get_line_metrics_at(0).unwrap();
-                    (point.x, metrics.baseline, metrics.ascent as f32, metrics.descent as f32)
+                    // Use entire selection as IME cursor rectangle.
+                    let start = start_points[2];
+                    let end = end_points[2];
+                    let rect = Rect::new(start.x, start.y, end.x, end.y + line_height);
+                    self.last_cursor_rect = Some(rect);
                 },
                 None => {
-                    // Put cursor at the bottom of the screen.
-                    let metrics = self.fallback_metrics();
-                    (point.x, -metrics.ascent as f64, -metrics.ascent, metrics.descent)
+                    // Get metrics at cursor position.
+                    let metrics = self.metrics_at(self.cursor_index);
+
+                    // Calculate cursor bounding box.
+                    let x = point.x + metrics.x;
+                    let y = point.y + metrics.baseline - metrics.ascent;
+                    let width = self.scale.round() as f32;
+                    let height = (metrics.ascent + metrics.descent).round();
+
+                    // Render the cursor rectangle.
+                    let rect = Rect::new(x, y, x + width, y + height);
+                    canvas.draw_rect(rect, &self.paint);
+
+                    self.last_cursor_rect = Some(rect);
                 },
-            };
-
-            // Calculate cursor bounding box.
-            let y = point.y + baseline as f32 - ascent;
-            let width = self.scale.round() as f32;
-            let height = (ascent + descent).round();
-
-            // Render the cursor rectangle.
-            let rect = Rect::new(x, y, x + width, y + height);
-            canvas.draw_rect(rect, &self.paint);
-
-            self.last_cursor_rect = Some(rect);
+            }
         }
     }
 
@@ -618,6 +651,7 @@ impl TextBox {
         self.scale = scale;
         self.dirty = true;
 
+        self.selection_style.set_font_size(self.font_size());
         self.text_style.set_font_size(self.font_size());
         self.fallback_metrics = None;
     }
@@ -649,15 +683,34 @@ impl TextBox {
         self.dirty = true;
 
         // Update font options.
+
         self.paint.set_color4f(config.colors.foreground.as_color4f(), None);
         self.text_style.set_foreground_paint(&self.paint);
         self.text_style.set_font_size(self.font_size());
         self.text_style.set_font_families(&[&self.font_family]);
+
+        self.selection_paint.set_color4f(config.colors.background.as_color4f(), None);
+        self.selection_style.set_foreground_paint(&self.selection_paint);
+        self.selection_paint.set_color4f(config.colors.highlight.as_color4f(), None);
+        self.selection_style.set_background_paint(&self.selection_paint);
+        self.selection_style.set_font_size(self.font_size());
+        self.selection_style.set_font_families(&[&self.font_family]);
     }
 
     /// Get the current font size.
     fn font_size(&self) -> f32 {
         (self.font_size * self.scale) as f32
+    }
+
+    /// Replace the entire text box content.
+    fn set_text(&mut self, text: String) {
+        self.cursor_index = text.len();
+        self.text = text;
+
+        self.clear_selection();
+
+        self.text_input_dirty = true;
+        self.dirty = true;
     }
 
     /// Handle new key press.
@@ -669,42 +722,62 @@ impl TextBox {
 
         match (keysym, modifiers.shift, modifiers.ctrl) {
             (Keysym::Left, false, false) => {
-                self.cursor_index = self.cursor_index.saturating_sub(1);
+                self.cursor_index = match self.selection.take() {
+                    Some(selection) => selection.start,
+                    None => self.cursor_index.saturating_sub(1),
+                };
+
                 self.text_input_dirty = true;
                 self.dirty = true;
             },
             (Keysym::Right, false, false) => {
-                self.cursor_index = cmp::min(self.cursor_index + 1, self.text.len());
+                self.cursor_index = match self.selection.take() {
+                    Some(selection) => selection.end,
+                    None => cmp::min(self.cursor_index + 1, self.text.len()),
+                };
+
                 self.text_input_dirty = true;
                 self.dirty = true;
             },
             (Keysym::BackSpace, false, false) => {
-                if self.text.is_empty() || self.cursor_index == 0 {
+                if self.text.is_empty() {
                     return;
                 }
 
-                // Jump to the previous character.
-                self.cursor_index = self.cursor_index.saturating_sub(1);
-                while self.cursor_index > 0 && !self.text.is_char_boundary(self.cursor_index) {
-                    self.cursor_index -= 1;
-                }
+                match self.selection.take() {
+                    Some(selection) => self.delete_selected(selection),
+                    None if self.cursor_index == 0 => return,
+                    None => {
+                        if self.text.is_empty() || self.cursor_index == 0 {
+                            return;
+                        }
 
-                // Pop the character after the cursor.
-                self.text.remove(self.cursor_index);
-                self.persist_text();
+                        // Jump to the previous character.
+                        self.cursor_index = self.cursor_index.saturating_sub(1);
+                        while self.cursor_index > 0
+                            && !self.text.is_char_boundary(self.cursor_index)
+                        {
+                            self.cursor_index -= 1;
+                        }
+
+                        // Pop the character after the cursor.
+                        self.text.remove(self.cursor_index);
+                        self.persist_text();
+                    },
+                }
 
                 self.text_input_dirty = true;
                 self.dirty = true;
             },
             (Keysym::Delete, false, false) => {
-                if self.cursor_index == self.text.len() {
-                    return;
-                }
-
-                // Pop character after the cursor.
-                if self.cursor_index < self.text.len() {
-                    self.text.remove(self.cursor_index);
-                    self.persist_text();
+                match self.selection.take() {
+                    Some(selection) => self.delete_selected(selection),
+                    None if self.cursor_index >= self.text.len() => return,
+                    // Pop character after the cursor.
+                    None => {
+                        self.text.remove(self.cursor_index);
+                        self.persist_text();
+                    },
                 }
 
                 self.text_input_dirty = true;
@@ -719,8 +792,12 @@ impl TextBox {
                 self.dirty = true;
             },
             (Keysym::XF86_Copy, ..) | (Keysym::C, true, true) => {
-                // We just copy all text since selection is not implemented yet.
-                let text = self.text.clone();
+                // Get selected text.
+                let text = match self.selection_text() {
+                    Some(text) => text.to_owned(),
+                    None => return,
+                };
+
                 self.event_loop.insert_idle(move |state| {
                     let serial = state.clipboard.next_serial();
                     let copy_paste_source = state
@@ -760,17 +837,25 @@ impl TextBox {
                 });
             },
             (keysym, _, false) => {
-                if let Some(key_char) = keysym.key_char() {
-                    // Add text at cursor position.
-                    self.text.insert(self.cursor_index, key_char);
-                    self.persist_text();
+                let key_char = match keysym.key_char() {
+                    Some(key_char) => key_char,
+                    None => return,
+                };
 
-                    // Move cursor behind inserted character.
-                    self.cursor_index += key_char.len_utf8();
-
-                    self.text_input_dirty = true;
-                    self.dirty = true;
+                // Delete selection before writing new text.
+                if let Some(selection) = self.selection.take() {
+                    self.delete_selected(selection);
                 }
+
+                // Add text at cursor position.
+                self.text.insert(self.cursor_index, key_char);
+                self.persist_text();
+
+                // Move cursor behind inserted character.
+                self.cursor_index += key_char.len_utf8();
+
+                self.text_input_dirty = true;
+                self.dirty = true;
             },
             _ => (),
         }
@@ -781,7 +866,7 @@ impl TextBox {
         // Adjust for text box being anchored to the bottom.
         position.y -= self.size.height as f64 - self.last_paragraph_height as f64;
 
-        let offset = self.byte_index_at(position).unwrap_or(0);
+        let offset = self.offset_at(position).unwrap_or(0);
         self.touch_state.down(config, time, position, offset);
     }
 
@@ -790,31 +875,98 @@ impl TextBox {
         // Adjust for text box being anchored to the bottom.
         position.y -= self.size.height as f64 - self.last_paragraph_height as f64;
 
-        self.touch_state.motion(config, position);
-    }
+        self.touch_state.motion(config, position, self.selection.as_ref());
 
-    /// Handle touch release.
-    pub fn touch_up(&mut self) {
-        // Ignore release handling for drag/focus actions.
-        if matches!(self.touch_state.action, TouchAction::Drag) {
-            return;
-        }
+        // Handle touch drag actions.
+        if let TouchAction::DragSelectionStart | TouchAction::DragSelectionEnd =
+            self.touch_state.action
+        {
+            let offset = self.offset_at(position).unwrap_or(0);
+            let selection = self.selection.as_mut().unwrap();
 
-        // Get byte offset from X/Y position.
-        let position = self.touch_state.last_position;
-        let offset = self.byte_index_at(position).unwrap_or(0);
+            // Update selection if it is at least one character wide.
+            let modifies_start = self.touch_state.action == TouchAction::DragSelectionStart;
+            if modifies_start && offset != selection.end {
+                selection.start = offset;
+            } else if !modifies_start && offset != selection.start {
+                selection.end = offset;
+            }
 
-        // Handle tap actions.
-        if let TouchAction::Tap = self.touch_state.action {
-            self.cursor_index = offset;
+            // Swap modified side when input carets "overtake" each other.
+            if selection.start > selection.end {
+                mem::swap(&mut selection.start, &mut selection.end);
+                self.touch_state.action = if modifies_start {
+                    TouchAction::DragSelectionEnd
+                } else {
+                    TouchAction::DragSelectionStart
+                };
+            }
 
             self.text_input_dirty = true;
             self.dirty = true;
         }
     }
 
+    /// Handle touch release.
+    pub fn touch_up(&mut self) {
+        // Ignore release handling for drag/focus actions.
+        if matches!(
+            self.touch_state.action,
+            TouchAction::Drag | TouchAction::DragSelectionStart | TouchAction::DragSelectionEnd
+        ) {
+            return;
+        }
+
+        // Get byte offset from X/Y position.
+        let position = self.touch_state.last_position;
+
+        // Handle tap actions.
+        match self.touch_state.action {
+            TouchAction::Tap => {
+                self.cursor_index = self.offset_at(position).unwrap_or(0);
+
+                self.clear_selection();
+
+                self.text_input_dirty = true;
+                self.dirty = true;
+            },
+            // Select word at touch position.
+            TouchAction::DoubleTap => {
+                let offset = self.offset_at(position).unwrap_or(0);
+
+                let mut word_start = 0;
+                let mut word_end = self.text.len();
+                for (i, c) in self.text.char_indices() {
+                    if i + 1 < offset && !c.is_alphanumeric() {
+                        word_start = i + 1;
+                    } else if i > offset && !c.is_alphanumeric() {
+                        word_end = i;
+                        break;
+                    }
+                }
+
+                self.select(word_start..word_end);
+            },
+            // Select everything.
+            TouchAction::TripleTap => {
+                let offset = self.offset_at(position).unwrap_or(0);
+                let start = self.text[..offset].rfind('\n').map_or(0, |i| i + 1);
+                let end = self.text[offset..].find('\n').map_or(self.text.len(), |i| offset + i);
+                self.select(start..end);
+            },
+            TouchAction::Drag | TouchAction::DragSelectionStart | TouchAction::DragSelectionEnd => {
+                unreachable!()
+            },
+        }
+    }
+
     /// Paste text into the input element.
     fn paste(&mut self, text: &str) {
+        // Delete selection before writing new text.
+        if let Some(selection) = self.selection.take() {
+            self.delete_selected(selection);
+        }
+
         // Add text to input element.
         if self.cursor_index == self.text.len() {
             self.text.push_str(text);
@@ -854,13 +1006,77 @@ impl TextBox {
     }
 
     /// Set preedit text at the current cursor position.
-    pub fn set_preedit_string(&mut self, text: String, _cursor_begin: i32, _cursor_end: i32) {
+    fn set_preedit_string(&mut self, text: String, _cursor_begin: i32, _cursor_end: i32) {
+        // Delete selection as soon as preedit starts.
+        if !text.is_empty()
+            && let Some(selection) = self.selection.take()
+        {
+            self.delete_selected(selection);
+        }
+
         self.preedit_text = text;
         self.dirty = true;
     }
 
-    /// Get byte offset at the specified position.
-    fn byte_index_at(&self, point: impl Into<Point>) -> Option<usize> {
+    /// Modify text selection.
+    fn select<R>(&mut self, range: R)
+    where
+        R: RangeBounds<usize>,
+    {
+        let mut start = match range.start_bound() {
+            Bound::Included(start) => *start,
+            Bound::Excluded(start) => *start + 1,
+            Bound::Unbounded => usize::MIN,
+        };
+        start = start.max(0);
+        let mut end = match range.end_bound() {
+            Bound::Included(end) => *end + 1,
+            Bound::Excluded(end) => *end,
+            Bound::Unbounded => usize::MAX,
+        };
+        end = end.min(self.text.len());
+
+        if start < end {
+            self.selection = Some(start..end);
+
+            self.text_input_dirty = true;
+            self.dirty = true;
+        } else {
+            self.clear_selection();
+        }
+    }
+
+    /// Clear text selection.
+    fn clear_selection(&mut self) {
+        self.selection = None;
+
+        self.text_input_dirty = true;
+        self.dirty = true;
+    }
+
+    /// Get selection text.
+    fn selection_text(&self) -> Option<&str> {
+        let selection = self.selection.as_ref()?;
+        Some(&self.text[selection.start..selection.end])
+    }
+
+    /// Delete the selected text.
+    ///
+    /// This automatically places the cursor at the start of the selection.
+    fn delete_selected(&mut self, selection: Range<usize>) {
+        // Remove selected text from input.
+        self.text.drain(selection.start..selection.end);
+        self.persist_text();
+
+        // Update cursor.
+        self.cursor_index = selection.start;
+
+        self.text_input_dirty = true;
+        self.dirty = true;
+    }
+
+    /// Get byte index at the specified position.
+    fn offset_at(&self, point: impl Into<Point>) -> Option<usize> {
         let paragraph = self.last_paragraph.as_ref()?;
         let position = match paragraph.get_glyph_position_at_coordinate(point) {
             PositionWithAffinity { affinity: Affinity::Upstream, position } => position as usize,
@@ -876,14 +1092,57 @@ impl TextBox {
         Some(position)
     }
 
+    /// Get metrics for the glyph at the specified offset.
+    fn metrics_at(&mut self, offset: usize) -> GlyphMetrics {
+        match &self.last_paragraph {
+            Some(paragraph) if offset > 0 => {
+                let line_number = paragraph.get_line_number_at(offset - 1).unwrap();
+
+                // Newlines are zerowidth glyphs at the end of the line, so we have to manually
+                // move the cursor to the start of the following line.
+                let (x, metrics) = if self.text.as_bytes()[offset - 1] == b'\n' {
+                    let metrics = paragraph.get_line_metrics_at(line_number + 1).unwrap();
+                    (0., metrics)
+                } else {
+                    let metrics = paragraph.get_line_metrics_at(line_number).unwrap();
+                    let cluster = paragraph.get_glyph_cluster_at(offset - 1).unwrap();
+                    (cluster.bounds.right, metrics)
+                };
+
+                GlyphMetrics::from_line_metrics(x, metrics)
+            },
+            Some(paragraph) => {
+                let metrics = paragraph.get_line_metrics_at(0).unwrap();
+                GlyphMetrics::from_line_metrics(0., metrics)
+            },
+            None => GlyphMetrics::from_font_metrics(0., self.fallback_metrics()),
+        }
+    }
+
+    /// Get the caret's triangle points at the specified offset.
+    fn caret_points(&mut self, offset: Point, index: usize) -> ([Point; 3], f32) {
+        let caret_size = (CARET_SIZE * self.scale).round() as f32;
+        let metrics = self.metrics_at(index);
+
+        let y = metrics.baseline - metrics.ascent;
+        let line_height = metrics.ascent + metrics.descent;
+
+        let points = [
+            Point::new(offset.x + metrics.x - caret_size, offset.y + y - caret_size),
+            Point::new(offset.x + metrics.x + caret_size, offset.y + y - caret_size),
+            Point::new(offset.x + metrics.x, offset.y + y),
+        ];
+
+        (points, line_height)
+    }
+
     /// Get surrounding text for IME.
     ///
-    /// This will return at most `max_len` bytes, while translating the
-    /// initial cursor position to the new position relative
-    /// to the surrounding text's start.
-    fn surrounding_text(&self, max_len: usize) -> (String, usize) {
-        // Get up to half of `max_len` after the cursor.
-        let mut end = self.cursor_index + max_len / 2;
+    /// This will return at most `MAX_SURROUNDING_BYTES` bytes plus the current
+    /// cursor positions relative to the surrounding text's origin.
+    fn surrounding_text(&self) -> (String, i32, i32) {
+        // Get up to half of `MAX_SURROUNDING_BYTES` after the cursor.
+        let mut end = self.cursor_index + MAX_SURROUNDING_BYTES / 2;
         if end >= self.text.len() {
             end = self.text.len();
         } else {
@@ -893,13 +1152,18 @@ impl TextBox {
         };
 
         // Get as many bytes as available before the cursor.
-        let remaining = max_len - (end - self.cursor_index);
+        let remaining = MAX_SURROUNDING_BYTES - (end - self.cursor_index);
         let mut start = self.cursor_index.saturating_sub(remaining);
         while start < self.text.len() && !self.text.is_char_boundary(start) {
             start += 1;
         }
 
-        (self.text[start..end].into(), self.cursor_index - start)
+        let (cursor_start, cursor_end) = match &self.selection {
+            Some(selection) => (selection.start as i32, selection.end as i32),
+            None => (self.cursor_index as i32, self.cursor_index as i32),
+        };
+
+        (self.text[start..end].into(), cursor_start - start as i32, cursor_end - start as i32)
     }
 
     /// Get font metrics for the fallback font.
@@ -1027,13 +1291,7 @@ impl TextBox {
             // Update input if text changed.
             if state.window.text_box.text != content {
                 info!("Reloading updated storage file");
-
-                state.window.text_box.cursor_index = content.len();
-                state.window.text_box.text = content;
-
-                state.window.text_box.text_input_dirty = true;
-                state.window.text_box.dirty = true;
-
+                state.window.text_box.set_text(content);
                 state.window.unstall();
             }
         })?;
@@ -1127,12 +1385,12 @@ struct TouchState {
     last_time: u32,
     last_position: Position<f64>,
     last_motion_position: Position<f64>,
-    start_byte_index: usize,
+    start_offset: usize,
 }
 
 impl TouchState {
     /// Update state from touch down event.
-    fn down(&mut self, config: &Config, time: u32, position: Position<f64>, byte_index: usize) {
+    fn down(&mut self, config: &Config, time: u32, position: Position<f64>, offset: usize) {
         // Update touch action.
         let delta = position - self.last_position;
         self.action = if self.last_time + config.input.max_multi_tap.as_millis() as u32 >= time
@@ -1148,8 +1406,8 @@ impl TouchState {
         };
 
         // Reset touch origin state.
-        self.start_byte_index = byte_index;
         self.last_motion_position = position;
+        self.start_offset = offset;
         self.last_position = position;
         self.last_time = time;
     }
@@ -1157,7 +1415,12 @@ impl TouchState {
     /// Update state from touch motion event.
     ///
     /// Returns the distance moved since the last touch down or motion.
-    fn motion(&mut self, config: &Config, position: Position<f64>) -> Position<f64> {
+    fn motion(
+        &mut self,
+        config: &Config,
+        position: Position<f64>,
+        selection: Option<&Range<usize>>,
+    ) -> Position<f64> {
         // Update incremental delta.
         let delta = position - self.last_motion_position;
         self.last_motion_position = position;
@@ -1173,7 +1436,19 @@ impl TouchState {
             return delta;
         }
 
-        self.action = TouchAction::Drag;
+        // Check if touch motion started on selection caret, with one character leeway.
+        self.action = match selection {
+            Some(selection) => {
+                if (self.start_offset as i32 - selection.end as i32).abs() < 2 {
+                    TouchAction::DragSelectionEnd
+                } else if (self.start_offset as i32 - selection.start as i32).abs() < 2 {
+                    TouchAction::DragSelectionStart
+                } else {
+                    TouchAction::Drag
+                }
+            },
+            _ => TouchAction::Drag,
+        };
 
         delta
     }
@@ -1187,4 +1462,33 @@ enum TouchAction {
     DoubleTap,
     TripleTap,
     Drag,
+    DragSelectionStart,
+    DragSelectionEnd,
+}
+
+/// Glyph position metrics for a paragraph.
+struct GlyphMetrics {
+    /// Baseline position from the top of the paragraph.
+    baseline: f32,
+    /// Glyph descent.
+    descent: f32,
+    /// Glyph ascent.
+    ascent: f32,
+    /// X position from the left of the paragraph.
+    x: f32,
+}
+
+impl GlyphMetrics {
+    fn from_line_metrics(x: f32, metrics: LineMetrics<'_>) -> Self {
+        Self {
+            x,
+            baseline: metrics.baseline as f32,
+            descent: metrics.descent as f32,
+            ascent: metrics.ascent as f32,
+        }
+    }
+
+    fn from_font_metrics(x: f32, metrics: FontMetrics) -> Self {
+        Self { x, baseline: -metrics.ascent, descent: metrics.descent, ascent: -metrics.ascent }
+    }
 }

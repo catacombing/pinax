@@ -37,6 +37,7 @@ This section documents the `[color]` table.
 |-|-|-|-|
 |foreground|Primary foreground color|color|`"#ffffff"`|
 |background|Primary background color|color|`"#181818"`|
+|highlight|Primary accent color|color|`"#752a2a"`|
 
 ### input
 

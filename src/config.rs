@@ -84,11 +84,18 @@ pub struct Colors {
     /// Primary background color.
     #[serde(alias = "bg")]
     pub background: Color,
+    /// Primary accent color.
+    #[serde(alias = "hl")]
+    pub highlight: Color,
 }
 
 impl Default for Colors {
     fn default() -> Self {
-        Self { foreground: Color::new(255, 255, 255), background: Color::new(24, 24, 24) }
+        Self {
+            foreground: Color::new(255, 255, 255),
+            background: Color::new(24, 24, 24),
+            highlight: Color::new(117, 42, 42),
+        }
     }
 }
 
