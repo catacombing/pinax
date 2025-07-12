@@ -11,8 +11,8 @@ use calloop::{LoopHandle, RegistrationToken};
 use calloop_notify::NotifySource;
 use calloop_notify::notify::{EventKind, RecursiveMode, Watcher};
 use skia_safe::textlayout::{
-    Affinity, FontCollection, LineMetrics, Paragraph, ParagraphBuilder, ParagraphStyle,
-    PositionWithAffinity, TextDecoration, TextStyle,
+    FontCollection, LineMetrics, Paragraph, ParagraphBuilder, ParagraphStyle, TextDecoration,
+    TextStyle,
 };
 use skia_safe::{
     Canvas as SkiaCanvas, Color4f, Font, FontMetrics, FontMgr, Paint, Path, Point, Rect,
@@ -649,8 +649,9 @@ impl TextBox {
                 let mut word_start = 0;
                 let mut word_end = self.text.len();
                 for (i, c) in self.text.char_indices() {
-                    if i + 1 < offset && !c.is_alphanumeric() {
-                        word_start = i + 1;
+                    let c_end = i + c.len_utf8();
+                    if c_end < offset && !c.is_alphanumeric() {
+                        word_start = c_end;
                     } else if i > offset && !c.is_alphanumeric() {
                         word_end = i;
                         break;
@@ -806,21 +807,19 @@ impl TextBox {
         let mut point = point.into();
         point.y -= self.scroll_offset;
 
-        // Translate position to byte index.
+        // Get glyph cluster at the location.
         let paragraph = self.last_paragraph.as_ref()?;
-        let position = match paragraph.get_glyph_position_at_coordinate(point) {
-            PositionWithAffinity { affinity: Affinity::Upstream, position } => position as usize,
-            // With downstream affinity, pick the index after the glyph.
-            PositionWithAffinity { affinity: Affinity::Downstream, position } => {
-                let mut offset = position as usize;
-                while offset < self.text.len() && !self.text.is_char_boundary(offset) {
-                    offset += 1;
-                }
-                offset
-            },
+        let cluster = paragraph.get_closest_glyph_cluster_at(point)?;
+
+        // Calculate index based on position within the cluster.
+        let width = cluster.bounds.right - cluster.bounds.left;
+        let index = if point.x - cluster.bounds.left < width / 2. {
+            cluster.text_range.start
+        } else {
+            cluster.text_range.end
         };
 
-        Some(position)
+        Some(index)
     }
 
     /// Get metrics for the glyph at the specified offset.
