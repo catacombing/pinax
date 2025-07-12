@@ -27,6 +27,7 @@ mod config;
 mod geometry;
 mod renderer;
 mod skia;
+mod text_box;
 mod wayland;
 mod window;
 
