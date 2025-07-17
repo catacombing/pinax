@@ -1,6 +1,12 @@
 # Pinax
 
-Pinax is a simple notes application for mobile Wayland systems.
+<p>
+  <img src="./logo.svg" width="10%" align="left">
+
+  Pinax is a simple notes application for mobile Wayland systems.
+
+  <br clear="align"/>
+</p>
 
 ## Configuration
 

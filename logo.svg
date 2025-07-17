@@ -1,0 +1,59 @@
+<svg
+   width="32"
+   height="32"
+   viewBox="0 0 32 32"
+   version="1.1"
+   id="svg1"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <path
+     style="fill:#666666;fill-opacity:1"
+     d="M 5,2 H 22.466 L 27,6.534 V 30 H 5 Z"
+     id="path9" />
+  <path
+     id="rect1"
+     d="m 6,3 h 16 l 4,4 V 29 H 6 Z"
+     style="fill:#262626;fill-opacity:1" />
+  <rect
+     style="fill:#666666;fill-opacity:1;stroke-width:0.641037"
+     id="rect6"
+     width="2.5"
+     height="1.5"
+     x="9.75"
+     y="23" />
+  <rect
+     style="fill:#666666;fill-opacity:1;stroke-width:1.52997"
+     id="rect7"
+     width="7.25"
+     height="1.5"
+     x="13.25"
+     y="23" />
+  <rect
+     style="fill:#666666;fill-opacity:1;stroke-width:0.79234"
+     id="rect8"
+     width="2.5"
+     height="1.5"
+     x="21.5"
+     y="23" />
+  <rect
+     style="fill:#666666;fill-opacity:1;stroke-width:1.18852"
+     id="rect9"
+     width="0.75"
+     height="0.75"
+     x="8"
+     y="25.875" />
+  <rect
+     style="fill:#666666;fill-opacity:1;stroke-width:0.810855"
+     id="rect6-3"
+     width="4"
+     height="1.5"
+     x="9.75"
+     y="25.5" />
+  <rect
+     style="fill:#666666;fill-opacity:1;stroke-width:1.18852"
+     id="rect9-2"
+     width="0.75"
+     height="0.75"
+     x="7.994"
+     y="23.375" />
+</svg>

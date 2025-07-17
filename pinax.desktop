@@ -3,5 +3,6 @@ Type=Application
 Name=Pinax
 Exec=pinax
 Comment=Wayland mobile notepad
+Icon=Pinax
 Categories=Utility;TextTools
 Keywords=mobile;wayland
