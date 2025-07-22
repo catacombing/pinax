@@ -325,6 +325,11 @@ impl Window {
         self.unstall();
     }
 
+    /// Persist current text content to disk.
+    pub fn persist_text(&mut self) {
+        self.text_box.persist_text();
+    }
+
     /// Apply pending text input changes.
     fn update_text_input(&mut self) {
         let origin = self.text_origin();

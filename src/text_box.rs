@@ -926,7 +926,7 @@ impl TextBox {
     /// Persist current text content to disk.
     ///
     /// This is automatically debounced to avoid excessive write operations.
-    fn persist_text(&mut self) {
+    pub fn persist_text(&mut self) {
         // Debounce periods before text is persisted to disk.
         const MIN_DEBOUNCE: Duration = Duration::from_millis(1000);
         const MAX_DEBOUNCE: Duration = Duration::from_millis(5000);

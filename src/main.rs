@@ -67,6 +67,9 @@ fn run() -> Result<(), Error> {
         event_loop.dispatch(None, &mut state)?;
     }
 
+    // Ensure text is saved on shutdown.
+    state.window.persist_text();
+
     Ok(())
 }
 
