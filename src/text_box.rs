@@ -1195,9 +1195,12 @@ impl TouchState {
         // Check if touch motion started on selection caret, with one character leeway.
         self.action = match selection {
             Some(selection) => {
-                if (self.start_offset as i32 - selection.end as i32).abs() < 2 {
+                let start_delta = (self.start_offset as i32 - selection.start as i32).abs();
+                let end_delta = (self.start_offset as i32 - selection.end as i32).abs();
+
+                if end_delta <= start_delta && end_delta < 2 {
                     TouchAction::DragSelectionEnd
-                } else if (self.start_offset as i32 - selection.start as i32).abs() < 2 {
+                } else if start_delta < 2 {
                     TouchAction::DragSelectionStart
                 } else {
                     TouchAction::Drag
