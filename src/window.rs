@@ -97,7 +97,7 @@ impl Window {
         }
         let viewport = protocol_states.viewporter.viewport(&queue, &surface);
 
-        // Default to a reasonable default size,
+        // Default to a reasonable default size.
         let size = Size { width: 360, height: 720 };
 
         Ok(Self {
@@ -130,7 +130,7 @@ impl Window {
         self.dirty = false;
 
         // Update IME state.
-        if self.text_box.text_input_dirty() {
+        if self.text_box.take_text_input_dirty() {
             self.update_text_input();
         }
 

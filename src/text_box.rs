@@ -152,9 +152,9 @@ impl TextBox {
         self.dirty
     }
 
-    /// Check whether the IME state needs to be updated.
-    pub fn text_input_dirty(&self) -> bool {
-        self.text_input_dirty
+    /// Retrieve and reset current IME dirtiness state.
+    pub fn take_text_input_dirty(&mut self) -> bool {
+        mem::take(&mut self.text_input_dirty)
     }
 
     /// Render text content to the canvas.
