@@ -8,6 +8,14 @@
   <br clear="align"/>
 </p>
 
+<br />
+
+## Screenshot
+
+<p align="center">
+  <img alt="pinax" src="https://github.com/user-attachments/assets/fab1a1c4-6374-40d8-84c7-cf6eddd7c0ed" width="30%" />
+</p>
+
 ## Configuration
 
 See [configuration file documentation](./docs/config.md).
