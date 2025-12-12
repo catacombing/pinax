@@ -693,7 +693,7 @@ impl TextBox {
         }
 
         // Add text to input element.
-        if self.cursor_index == self.text.len() {
+        if self.cursor_index >= self.text.len() {
             self.text.push_str(text);
         } else {
             self.text.insert_str(self.cursor_index, text);
@@ -831,7 +831,7 @@ impl TextBox {
             cluster.text_range.end
         };
 
-        Some(index)
+        Some(index.min(self.text.len()))
     }
 
     /// Get metrics for the glyph at the specified offset.
