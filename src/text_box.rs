@@ -734,6 +734,11 @@ impl TextBox {
 
     /// Set preedit text at the current cursor position.
     pub fn set_preedit_string(&mut self, text: String, _cursor_begin: i32, _cursor_end: i32) {
+        // Ignore if preedit text did not change.
+        if self.preedit_text == text {
+            return;
+        }
+
         // Delete selection as soon as preedit starts.
         if !text.is_empty()
             && let Some(selection) = self.selection.take()
@@ -785,6 +790,10 @@ impl TextBox {
 
     /// Clear text selection.
     fn clear_selection(&mut self) {
+        if self.selection.is_none() {
+            return;
+        }
+
         self.selection = None;
 
         self.text_input_dirty = true;
