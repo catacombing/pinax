@@ -43,7 +43,7 @@ const PADDING: f64 = 15.;
 /// Wayland window.
 pub struct Window {
     pub queue: QueueHandle<State>,
-    pub initial_draw_done: bool,
+    pub initial_configure_done: bool,
     pub text_box: TextBox,
 
     connection: Connection,
@@ -112,7 +112,7 @@ impl Window {
             stalled: true,
             dirty: true,
             scale: 1.,
-            initial_draw_done: Default::default(),
+            initial_configure_done: Default::default(),
             text_input: Default::default(),
             ime_cause: Default::default(),
             canvas: Default::default(),
@@ -122,11 +122,10 @@ impl Window {
     /// Redraw the window.
     pub fn draw(&mut self) {
         // Stall rendering if nothing changed since last redraw.
-        if !self.dirty() {
+        if !self.dirty() || !self.initial_configure_done {
             self.stalled = true;
             return;
         }
-        self.initial_draw_done = true;
         self.dirty = false;
 
         // Update IME state.
@@ -186,6 +185,7 @@ impl Window {
             return;
         }
 
+        self.initial_configure_done = true;
         self.size = size;
         self.dirty = true;
 
