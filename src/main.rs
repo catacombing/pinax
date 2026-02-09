@@ -279,6 +279,8 @@ enum Error {
     Glutin(#[from] glutin::error::Error),
     #[error("{0}")]
     Notify(#[from] calloop_notify::notify::Error),
+    #[error("invalid storage path")]
+    InvalidStoragePath,
 }
 
 impl<T> From<calloop::InsertError<T>> for Error {

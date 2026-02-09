@@ -107,8 +107,15 @@ impl TextBox {
         let mut font_collection = FontCollection::new();
         font_collection.set_default_font_manager(FontMgr::new(), None);
 
-        // Read initial text from file.
+        // Ensure storage directory exists.
         let storage_path = config.general.storage_path();
+        let parent_dir = storage_path.parent().ok_or(Error::InvalidStoragePath)?;
+        if let Err(err) = fs::create_dir_all(parent_dir) {
+            error!("Could not create storage file directories: {err}");
+            return Err(Error::InvalidStoragePath);
+        }
+
+        // Read initial text from file.
         let text = Self::read_to_string(&storage_path).unwrap_or_default();
         let cursor_index = text.len();
 
@@ -968,25 +975,11 @@ impl TextBox {
     fn atomic_write(&mut self) {
         self.persist_start = None;
 
-        // Get storage directory.
-        let target_dir = match self.storage_path.parent() {
-            Some(parent) => parent,
-            None => {
-                error!("Storage path cannot be filesystem root");
-                return;
-            },
-        };
-
-        // Ensure parent directory exists.
-        if let Err(err) = fs::create_dir_all(target_dir) {
-            error!("Could not create parent directories: {err}");
-            return;
-        }
-
         // Create a tempfile "next to" the target path.
         //
         // Creating this in the same directory as the target path should avoid errors
         // due to persisting across filesystems.
+        let target_dir = self.storage_path.parent().unwrap();
         let mut tempfile = match NamedTempFile::new_in(target_dir) {
             Ok(tempfile) => tempfile,
             Err(err) => {
@@ -1014,13 +1007,7 @@ impl TextBox {
         event_loop: &LoopHandle<'static, State>,
         storage_path: PathBuf,
     ) -> Result<(), Error> {
-        let parent = match storage_path.parent() {
-            Some(parent) => parent,
-            None => {
-                error!("Storage path cannot be filesystem root");
-                return Ok(());
-            },
-        };
+        let parent = storage_path.parent().unwrap();
 
         // Create new monitor for the parent directory.
         let mut notify_source = NotifySource::new()?;
